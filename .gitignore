@@ -1,0 +1,15 @@
+# Ambiente virtual e caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Banco vetorial local gerado em runtime (recriado na indexação)
+data/processed/chroma_db/
+
+# Arquivos de sistema e variáveis de ambiente locais
+.env
+.DS_Store
+Thumbs.db
