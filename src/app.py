@@ -32,7 +32,9 @@ from src.ingestion.fetcher import DEFAULT_RAW_DIR, run_ingestion_fetcher
 from src.ingestion.parser import DEFAULT_OUTPUT_JSONL, run_parser_pipeline
 import src.rag.engine as _engine_mod
 
-if not hasattr(_engine_mod.LGPDRagEngine, "_discover_available_models"):
+if not hasattr(_engine_mod.LGPDRagEngine, "_discover_available_models") or not hasattr(
+    _engine_mod.LGPDRagEngine, "_embedding_cache"
+):
     importlib.reload(_engine_mod)
 
 from src.rag.engine import (
@@ -200,29 +202,35 @@ def _inject_lix_inspired_css() -> None:
             margin-bottom: 0.75rem;
         }
 
-        /* Caixa de inserção de texto do mesmo tamanho exato dos blocos centralizados */
-        div[data-testid="stChatInput"] {
-            width: 100% !important;
-            max-width: 100% !important;
-            margin: 0 auto 1.15rem auto !important;
-            box-sizing: border-box !important;
+        /* Barra de digitação fixa no rodapé com a mesma largura (920px) dos blocos centralizados */
+        div[data-testid="stBottom"] {
+            background: linear-gradient(180deg, rgba(9, 13, 20, 0.0) 0%, rgba(9, 13, 20, 0.92) 38%, #090d14 100%) !important;
         }
-        div[data-testid="stChatInput"] > div {
-            width: 100% !important;
-            max-width: 100% !important;
-            background: #0b0f17 !important;
-            border: 1px solid rgba(56, 189, 248, 0.26) !important;
-            border-radius: 16px !important;
-            padding: 0.25rem 0.45rem !important;
-            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42) !important;
-        }
+        div[data-testid="stBottom"] > div,
         div[data-testid="stBottomBlockContainer"] {
             max-width: 920px !important;
             width: 100% !important;
             margin: 0 auto !important;
             padding-left: 1rem !important;
             padding-right: 1rem !important;
+            padding-bottom: 1.1rem !important;
             box-sizing: border-box !important;
+            background: transparent !important;
+        }
+        div[data-testid="stChatInput"] {
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 auto !important;
+            box-sizing: border-box !important;
+        }
+        div[data-testid="stChatInput"] > div {
+            width: 100% !important;
+            max-width: 100% !important;
+            background: #0b0f17 !important;
+            border: 1px solid rgba(56, 189, 248, 0.28) !important;
+            border-radius: 16px !important;
+            padding: 0.25rem 0.45rem !important;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55) !important;
         }
         .pro-header-bar {
             display: flex;
@@ -366,7 +374,7 @@ def _init_session_state() -> None:
         st.session_state["pending_suggestion"] = None
     if (
         "rag_engine" not in st.session_state
-        or not hasattr(st.session_state["rag_engine"], "_discover_available_models")
+        or not hasattr(st.session_state["rag_engine"], "_embedding_cache")
     ):
         st.session_state["rag_engine"] = LGPDRagEngine(
             api_key=st.session_state["gemini_api_key"]
@@ -557,14 +565,7 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
         unsafe_allow_html=True,
     )
 
-    # 3. Caixa de Inserção de Texto Centralizada (mesma largura exata dos blocos de informação)
-    prompt_container = st.container()
-    with prompt_container:
-        user_input = st.chat_input(
-            "Pergunte qualquer coisa sobre a LGPD ou Resoluções da ANPD..."
-        )
-
-    # 4. Três Cards Minimalistas de Ação Rápida (mesma largura da estrutura central)
+    # 3. Três Cards Minimalistas de Ação Rápida (mesma largura da estrutura central)
     cols = st.columns(3)
     for idx, card in enumerate(FEATURED_CARDS):
         with cols[idx]:
@@ -584,7 +585,7 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
             ):
                 st.session_state["pending_suggestion"] = card["prompt"]
 
-    # 5. Mais Sugestões Minimizadas
+    # 4. Mais Sugestões Minimizadas
     with st.expander("💡 Mais Sugestões de Consulta (minimizadas)", expanded=False):
         s_cols = st.columns(2)
         for idx, sug in enumerate(EXTRA_SUGGESTIONS):
@@ -596,7 +597,7 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
     if st.session_state["messages"]:
         st.divider()
 
-    # 6. Estrutura de Conversa (Pergunta do Usuário -> Resposta do Chatbot + Contexto Completo)
+    # 5. Estrutura de Conversa (Pergunta do Usuário -> Resposta do Chatbot + Contexto Completo)
     for msg in st.session_state["messages"]:
         avatar = "🧑‍💼" if msg["role"] == "user" else "🛡️"
         with st.chat_message(msg["role"], avatar=avatar):
@@ -607,6 +608,10 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
                 if msg.get("trace") is not None:
                     _render_request_response_inspector(msg)
 
+    # 6. Barra de Digitação Fixa na Parte Inferior (com max-width 920px alinhada aos blocos)
+    user_input = st.chat_input(
+        "Pergunte qualquer coisa sobre a LGPD ou Resoluções da ANPD..."
+    )
     active_question = user_input or st.session_state.get("pending_suggestion")
     if st.session_state.get("pending_suggestion"):
         st.session_state["pending_suggestion"] = None

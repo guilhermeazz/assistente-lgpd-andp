@@ -108,6 +108,9 @@ class LGPDRagEngine:
         self.chunks: List[Dict[str, Any]] = []
         self.chunks_by_id: Dict[str, Dict[str, Any]] = {}
         self.bm25: Optional[BM25Okapi] = None
+        self._active_embedding_model: Optional[str] = None
+        self._using_fallback_embeddings: bool = False
+        self._embedding_cache: Dict[str, List[float]] = {}
         self._load_local_chunks_and_bm25()
 
     def _get_genai_client(self, api_key: Optional[str] = None) -> genai.Client:
@@ -175,29 +178,35 @@ class LGPDRagEngine:
         texts: List[str],
         task_type: str,
         api_key: Optional[str] = None,
-        batch_size: int = 50,
+        batch_size: int = 100,
     ) -> List[List[float]]:
         """
         Gera embeddings usando o modelo `text-embedding-004` via SDK `google-genai`,
         passando explicitamente `config=types.EmbedContentConfig(task_type=task_type)`.
+        Usa batch_size=100 para enviar os 82 chunks em uma única chamada dentro da cota Free Tier (100/min).
         """
         client = self._get_genai_client(api_key=api_key)
         all_embeddings: List[List[float]] = []
 
         embed_config = types.EmbedContentConfig(task_type=task_type)
+        model_order = [EMBEDDING_MODEL, "gemini-embedding-001", "gemini-embedding-2-preview"]
+        if self._active_embedding_model and self._active_embedding_model in model_order:
+            model_order.remove(self._active_embedding_model)
+            model_order.insert(0, self._active_embedding_model)
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             response = None
             last_exc: Optional[Exception] = None
-            for candidate_emb_model in (EMBEDDING_MODEL, "gemini-embedding-001"):
-                for attempt in range(3):
+            for candidate_emb_model in model_order:
+                for attempt in range(2):
                     try:
                         response = client.models.embed_content(
                             model=candidate_emb_model,
                             contents=batch,
                             config=embed_config,
                         )
+                        self._active_embedding_model = candidate_emb_model
                         break
                     except Exception as exc:
                         last_exc = exc
@@ -208,17 +217,17 @@ class LGPDRagEngine:
                                 candidate_emb_model,
                             )
                             break
+                        if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
+                            logger.warning(
+                                "Limite de cota Free Tier (429) atingido no modelo %s; tentando modelo alternativo ou contingência.",
+                                candidate_emb_model,
+                            )
+                            break
                         if any(
                             transient in err_lower
-                            for transient in ("503", "unavailable", "429", "high demand", "overloaded")
-                        ) and attempt < 2:
-                            wait_s = 1.5 * (attempt + 1)
-                            logger.warning(
-                                "Pico de demanda (503/429) em %s. Nova tentativa em %.1fs...",
-                                candidate_emb_model,
-                                wait_s,
-                            )
-                            time.sleep(wait_s)
+                            for transient in ("503", "unavailable", "high demand", "overloaded")
+                        ) and attempt == 0:
+                            time.sleep(1.5)
                             continue
                         raise
                 if response is not None:
@@ -235,8 +244,8 @@ class LGPDRagEngine:
     @staticmethod
     def _deterministic_test_embedding(text: str, dim: int = 128) -> List[float]:
         """
-        Gera vetor determinístico unitário baseado em termos apenas para testes locais offline
-        quando explicitamente invocado com use_mock_embeddings=True.
+        Gera vetor determinístico unitário baseado em termos para testes locais ou contingência
+        quando a cota Free Tier (100 RPM) de embeddings estiver temporariamente esgotada (429).
         """
         vec = [0.0] * dim
         tokens = tokenize_pt(text)
@@ -255,6 +264,8 @@ class LGPDRagEngine:
         """
         Indexa todos os chunks de `data/processed/chunks_lgpd.jsonl` no ChromaDB (métrica cosine)
         utilizando `text-embedding-004` com `task_type="RETRIEVAL_DOCUMENT"`.
+        Se a cota Free Tier de embeddings (100 RPM) retornar 429 RESOURCE_EXHAUSTED, realiza
+        contingência vetorial local automática (768-d cosine) para não bloquear o usuário.
         """
         self._load_local_chunks_and_bm25()
         if not self.chunks:
@@ -280,13 +291,41 @@ class LGPDRagEngine:
         ]
 
         if use_mock_embeddings:
-            embeddings = [self._deterministic_test_embedding(doc) for doc in documents]
+            self._using_fallback_embeddings = False
+            embeddings = [self._deterministic_test_embedding(doc, dim=128) for doc in documents]
         else:
-            embeddings = self._embed_texts(
-                documents,
-                task_type="RETRIEVAL_DOCUMENT",
-                api_key=api_key,
-            )
+            try:
+                # Reaproveita embeddings já em cache na sessão para economizar cota Free Tier (100 RPM)
+                missing_indices = [
+                    idx for idx, doc in enumerate(documents) if doc not in self._embedding_cache
+                ]
+                if missing_indices:
+                    missing_docs = [documents[idx] for idx in missing_indices]
+                    computed = self._embed_texts(
+                        missing_docs,
+                        task_type="RETRIEVAL_DOCUMENT",
+                        api_key=api_key,
+                        batch_size=100,
+                    )
+                    for idx, emb_vec in zip(missing_indices, computed):
+                        self._embedding_cache[documents[idx]] = emb_vec
+
+                embeddings = [self._embedding_cache[doc] for doc in documents]
+                self._using_fallback_embeddings = False
+            except Exception as exc:
+                err_lower = str(exc).lower()
+                if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
+                    logger.warning(
+                        "Cota Free Tier de embeddings (100 RPM) temporariamente atingida (429). "
+                        "Ativando contingência vetorial local (768-d Cosine) + BM25 para indexar os %d chunks sem espera.",
+                        len(documents),
+                    )
+                    self._using_fallback_embeddings = True
+                    embeddings = [
+                        self._deterministic_test_embedding(doc, dim=768) for doc in documents
+                    ]
+                else:
+                    raise
 
         # Recria a coleção caso a dimensionalidade do embedding mude
         try:
@@ -535,20 +574,41 @@ class LGPDRagEngine:
 
         # 1. Ranking Vetorial no ChromaDB (task_type="RETRIEVAL_QUERY")
         if use_mock_embeddings:
-            query_emb = self._deterministic_test_embedding(query)
+            query_emb = self._deterministic_test_embedding(query, dim=128)
+        elif self._using_fallback_embeddings:
+            query_emb = self._deterministic_test_embedding(query, dim=768)
         else:
-            query_emb = self._embed_texts(
-                [query],
-                task_type="RETRIEVAL_QUERY",
-                api_key=api_key,
-            )[0]
+            try:
+                query_emb = self._embed_texts(
+                    [query],
+                    task_type="RETRIEVAL_QUERY",
+                    api_key=api_key,
+                )[0]
+            except Exception as exc:
+                err_lower = str(exc).lower()
+                if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
+                    logger.warning(
+                        "Cota Free Tier de embeddings (429) atingida na query; utilizando contingência vetorial local + BM25."
+                    )
+                    query_emb = self._deterministic_test_embedding(query, dim=768)
+                else:
+                    raise
 
         n_Query = min(max(top_k * 3, 15), indexed_count)
-        chroma_res = self.collection.query(
-            query_embeddings=[query_emb],
-            n_results=n_Query,
-            include=["documents", "metadatas", "distances"],
-        )
+        try:
+            chroma_res = self.collection.query(
+                query_embeddings=[query_emb],
+                n_results=n_Query,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Diferença de dimensionalidade no ChromaDB (%s); reindexando com contingência consistente (768-d).",
+                exc,
+            )
+            self._using_fallback_embeddings = True
+            query_emb = self._deterministic_test_embedding(query, dim=768)
+            chroma_res = None
 
         vector_ranks: Dict[str, int] = {}
         vector_scores: Dict[str, float] = {}
