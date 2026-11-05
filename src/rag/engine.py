@@ -86,12 +86,19 @@ class LGPDRagEngine:
         self.chroma_dir = Path(chroma_dir) if chroma_dir else None
         self.collection_name = collection_name
 
-        # Inicializa ChromaDB com métrica cosine obrigatória
+        # Inicializa ChromaDB com métrica cosine obrigatória (com fallback para EphemeralClient em containers Cloud)
         if in_memory_chroma or self.chroma_dir is None:
             self.chroma_client = chromadb.EphemeralClient()
         else:
-            self.chroma_dir.mkdir(parents=True, exist_ok=True)
-            self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            try:
+                self.chroma_dir.mkdir(parents=True, exist_ok=True)
+                self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            except Exception as exc:
+                logger.warning(
+                    "PersistentClient indisponível no container (%s); utilizando EphemeralClient.",
+                    exc,
+                )
+                self.chroma_client = chromadb.EphemeralClient()
 
         self.collection = self.chroma_client.get_or_create_collection(
             name=self.collection_name,
@@ -116,19 +123,36 @@ class LGPDRagEngine:
         """Carrega os chunks do arquivo JSONL e constrói o índice lexical BM25 em memória."""
         self.chunks = []
         self.chunks_by_id = {}
-        if not self.chunks_path.exists():
-            logger.info("Arquivo de chunks ainda não existe em %s", self.chunks_path)
-            self.bm25 = None
-            return
 
-        with self.chunks_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                self.chunks.append(item)
-                self.chunks_by_id[item["id"]] = item
+        if self.chunks_path.exists():
+            with self.chunks_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    self.chunks.append(item)
+                    self.chunks_by_id[item["id"]] = item
+
+        # Se estiver no ambiente principal (ex: Streamlit Cloud) e a base tiver menos de 65 chunks,
+        # reconstrói automaticamente a base completa (79 artigos LGPD + PDFs ANPD = 82 chunks)
+        if self.chunks_path == DEFAULT_CHUNKS_PATH and len(self.chunks) < 65:
+            logger.warning(
+                "Base de chunks ausente ou incompleta (%d chunks). Reconstruindo base normativa completa...",
+                len(self.chunks),
+            )
+            try:
+                from src.ingestion.fetcher import DEFAULT_RAW_DIR, run_ingestion_fetcher
+                from src.ingestion.parser import run_parser_pipeline
+
+                run_ingestion_fetcher(raw_dir=DEFAULT_RAW_DIR)
+                rebuilt = run_parser_pipeline(
+                    raw_dir=DEFAULT_RAW_DIR, output_jsonl=self.chunks_path
+                )
+                self.chunks = rebuilt
+                self.chunks_by_id = {item["id"]: item for item in rebuilt}
+            except Exception as exc:
+                logger.warning("Não foi possível reconstruir base automaticamente: %s", exc)
 
         if self.chunks:
             tokenized_corpus = [tokenize_pt(c["texto"]) for c in self.chunks]

@@ -237,3 +237,23 @@ def test_anpd_pdf_chunks_and_hybrid_retrieval_with_cross_ref_expansion(
         assert 1 <= len(cross_refs) <= 2, "Deve anexar até 2 artigos complementares por referência cruzada."
         for cr in cross_refs:
             assert "Referência Cruzada Automática" in cr["origem"]
+
+
+def test_cloud_waf_self_healing_guarantees_all_lgpd_articles(tmp_path: Path) -> None:
+    """
+    Simula o cenário do Streamlit Cloud onde o WAF do Planalto retorna uma página HTML
+    de bloqueio/desafio (0 artigos) para IPs de data center nos EUA e garante que o
+    parser recompõe automaticamente os 79 artigos da LGPD.
+    """
+    waf_blocked_html = tmp_path / "lgpd_compilada.html"
+    waf_blocked_html.write_text(
+        "<html><body><h1>Access Denied - WAF Challenge</h1></body></html>",
+        encoding="utf-8",
+    )
+    recovered_chunks = parse_lgpd_html(waf_blocked_html)
+    assert len(recovered_chunks) >= 79
+    artigos_rec = {c["metadata"]["artigo"] for c in recovered_chunks}
+    assert "Art. 1º" in artigos_rec
+    assert "Art. 55-J" in artigos_rec
+    assert "Art. 65" in artigos_rec
+

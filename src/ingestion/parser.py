@@ -117,43 +117,56 @@ def extract_artigos_citados(texto_artigo: str, self_artigo: str) -> str:
 def remove_revoked_and_struck_elements(soup: BeautifulSoup) -> BeautifulSoup:
     """
     Remove todas as tags <strike>, <s>, <del> e qualquer elemento com CSS line-through
-    (usado pelo Planalto para marcar dispositivos revogados ou vetados).
+    (usado pelo Planalto para marcar dispositivos revogados ou vetados), protegendo contra
+    tags não fechadas do FrontPage/Word que englobem múltiplos artigos vigentes.
     """
-    for tag_name in ("strike", "s", "del", "script", "style", "head"):
+    for tag_name in ("script", "style", "head"):
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # Remove qualquer tag com style contendo line-through ou class indicando tachado
+    for tag_name in ("strike", "s", "del"):
+        for tag in list(soup.find_all(tag_name)):
+            if getattr(tag, "decomposed", False):
+                continue
+            # Proteção contra tag <strike> não fechada no HTML do Planalto que engole vários artigos
+            tag_text = tag.get_text(" ", strip=True)
+            if len(re.findall(r"\bArt\.\s*\d", tag_text, flags=re.IGNORECASE)) > 2:
+                tag.unwrap()
+            else:
+                tag.decompose()
+
+    # Remove qualquer tag folha/bloco com style contendo line-through ou class indicando tachado
+    container_tags = {"html", "body", "div", "table", "tbody", "tr", "td", "section", "main", "article"}
     for tag in list(soup.find_all(True)):
         if getattr(tag, "decomposed", False) or tag.attrs is None:
+            continue
+        if tag.name in container_tags:
             continue
         style_val = str(tag.get("style", "")).lower()
         class_val = " ".join(tag.get("class", [])).lower() if tag.get("class") else ""
         if "line-through" in style_val or "line-through" in class_val or "strike" in class_val:
-            tag.decompose()
+            tag_text = tag.get_text(" ", strip=True)
+            if len(re.findall(r"\bArt\.\s*\d", tag_text, flags=re.IGNORECASE)) <= 2:
+                tag.decompose()
 
     return soup
 
 
 def _clean_line(line: str) -> str:
-    """Normaliza espaços múltiplos e quebras internas de linha."""
-    return re.sub(r"\s+", " ", line).strip()
+    """Normaliza espaços múltiplos, non-breaking spaces (&nbsp;) e quebras internas de linha."""
+    return re.sub(r"\s+", " ", line.replace("\xa0", " ")).strip()
 
 
-def parse_lgpd_html(html_path: Path) -> List[Dict[str, Any]]:
-    """
-    Realiza o parsing semântico-estrutural do HTML compilado da LGPD (Planalto),
-    retornando a lista de chunks atômicos por artigo com Breadcrumb e metadados ricos.
-    """
-    if not html_path.exists():
-        raise FileNotFoundError(f"Arquivo HTML da LGPD não encontrado: {html_path}")
-
-    raw_html = html_path.read_text(encoding="utf-8", errors="replace")
+def _parse_lgpd_html_content(raw_html: str, source_filename: str) -> List[Dict[str, Any]]:
+    """Extrai os chunks atômicos de artigos da LGPD a partir de uma string HTML."""
     soup = BeautifulSoup(raw_html, "html.parser")
     soup = remove_revoked_and_struck_elements(soup)
 
-    # Extrai blocos textuais de parágrafos e títulos ou linhas do texto limpo
-    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all(["p", "div", "h1", "h2", "h3", "h4", "li"])]
+    # Extrai blocos textuais de parágrafos e títulos (sem <div> para não duplicar o documento inteiro)
+    paragraphs = [
+        p.get_text(" ", strip=True)
+        for p in soup.find_all(["p", "h1", "h2", "h3", "h4", "li"])
+    ]
     if not paragraphs:
         paragraphs = soup.get_text("\n").splitlines()
 
@@ -307,11 +320,42 @@ def parse_lgpd_html(html_path: Path) -> List[Dict[str, Any]]:
                     "artigo": art_id,
                     "artigos_citados": artigos_citados,
                     "pagina": idx,
-                    "arquivo": html_path.name,
+                    "arquivo": source_filename,
                     "breadcrumb": breadcrumb,
                 },
             }
         )
+
+    return chunks
+
+
+def parse_lgpd_html(html_path: Path) -> List[Dict[str, Any]]:
+    """
+    Realiza o parsing semântico-estrutural do HTML compilado da LGPD (Planalto),
+    retornando a lista de chunks atômicos por artigo com Breadcrumb e metadados ricos.
+    Em ambientes de nuvem (ex: Streamlit Cloud) onde o WAF do Planalto pode retornar
+    páginas de bloqueio/desafio ou HTML truncado (< 65 artigos), aciona automaticamente
+    a recomposição da base integral da LGPD Compilada (79 artigos).
+    """
+    if not html_path.exists():
+        raise FileNotFoundError(f"Arquivo HTML da LGPD não encontrado: {html_path}")
+
+    raw_html = html_path.read_text(encoding="utf-8", errors="replace")
+    chunks = _parse_lgpd_html_content(raw_html, source_filename=html_path.name)
+
+    # Auto-recuperação caso o arquivo principal lgpd_compilada.html tenha sido sobrescrito por página WAF
+    if html_path.name.lower().startswith("lgpd") and len(chunks) < 65:
+        logger.warning(
+            "Arquivo %s resultou em apenas %d artigos (possível bloqueio WAF/HTML truncado no Cloud). "
+            "Restaurando base completa da LGPD Compilada (79 artigos).",
+            html_path.name,
+            len(chunks),
+        )
+        from src.ingestion.fetcher import _build_fallback_lgpd_html
+
+        fallback_html = _build_fallback_lgpd_html()
+        html_path.write_text(fallback_html, encoding="utf-8")
+        chunks = _parse_lgpd_html_content(fallback_html, source_filename=html_path.name)
 
     logger.info("LGPD HTML processado com sucesso: %d artigos extraídos.", len(chunks))
     return chunks

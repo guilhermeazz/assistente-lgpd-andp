@@ -705,6 +705,15 @@ def fetch_lgpd_html(
         except UnicodeDecodeError:
             html_text = raw_bytes.decode("utf-8", errors="replace")
 
+        # Valida se a resposta não é uma página de bloqueio WAF/Captcha (comum em IPs de Cloud fora do Brasil)
+        from src.ingestion.parser import _parse_lgpd_html_content
+
+        parsed_preview = _parse_lgpd_html_content(html_text, source_filename=LGPD_FILENAME)
+        if "13.709" not in html_text or len(parsed_preview) < 65:
+            raise ValueError(
+                f"Resposta do Planalto bloqueada por WAF ou incompleta ({len(parsed_preview)} artigos detectados)."
+            )
+
         utf8_bytes = html_text.encode("utf-8")
         new_hash = compute_sha256(utf8_bytes)
         old_hash = get_file_sha256(target_path)
@@ -742,12 +751,27 @@ def fetch_lgpd_html(
         )
         logger.warning(warning_msg)
 
-        # Verifica quaisquer arquivos .html já presentes em data/raw/
+        # Verifica quaisquer arquivos .html já presentes em data/raw/ e garante que tenham >= 65 artigos
+        from src.ingestion.parser import _parse_lgpd_html_content
+
         existing_htmls = list(raw_dir.glob("*.html")) + list(raw_dir.glob("*.htm"))
-        if not target_path.exists() and not existing_htmls:
+        needs_fallback_seed = not target_path.exists() and not existing_htmls
+        if not needs_fallback_seed:
+            candidate_check = target_path if target_path.exists() else existing_htmls[0]
+            try:
+                check_chunks = _parse_lgpd_html_content(
+                    candidate_check.read_text(encoding="utf-8", errors="replace"),
+                    source_filename=candidate_check.name,
+                )
+                if len(check_chunks) < 65:
+                    needs_fallback_seed = True
+            except Exception:
+                needs_fallback_seed = True
+
+        if needs_fallback_seed:
             logger.warning(
-                "Nenhum HTML local encontrado em %s. Gerando base local da LGPD Compilada em UTF-8 para contingência.",
-                raw_dir,
+                "Gerando/restaurando base local completa da LGPD Compilada (79 artigos) em UTF-8 em %s.",
+                target_path,
             )
             fallback_html = _build_fallback_lgpd_html()
             target_path.write_text(fallback_html, encoding="utf-8")
