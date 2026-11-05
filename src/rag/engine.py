@@ -67,6 +67,59 @@ def tokenize_pt(text: str) -> List[str]:
     return re.findall(r"[a-z0-9áàâãéêíóôõúçº°]+(?:-[a-z0-9]+)?", cleaned)
 
 
+COLLOQUIAL_TO_LEGAL_MAP: List[Tuple[Tuple[str, ...], str]] = [
+    (
+        ("vaza", "vazamento", "vazando", "vazou", "exposto", "invadido", "hacker", "ataque", "acidentalmente", "acidente"),
+        "incidente de segurança acessos não autorizados situações acidentais ou ilícitas comunicação à autoridade nacional Art. 46 Art. 48 Art. 44 Art. 42",
+    ),
+    (
+        ("cpf", "rg", "cnh", "endereço", "telefone", "celular", "email", "e-mail", "cadastro", "usuario", "usuário", "cliente"),
+        "dado pessoal pessoa natural identificada ou identificável titular Art. 5º",
+    ),
+    (
+        ("biometria", "biométrico", "saúde", "doença", "religião", "genético", "facial"),
+        "dado pessoal sensível Art. 5º Art. 11",
+    ),
+    (
+        ("criança", "adolescente", "menor de idade", "menores"),
+        "tratamento de dados pessoais de crianças e de adolescentes Art. 14",
+    ),
+    (
+        ("site", "aplicativo", "app", "sistema", "plataforma", "loja", "empresa"),
+        "controlador operador agentes de tratamento segurança e boas práticas Art. 42 Art. 46",
+    ),
+    (
+        ("apagar", "excluir", "deletar", "descadastrar", "remover"),
+        "direito do titular eliminação término do tratamento revogação do consentimento Art. 18 Art. 15 Art. 16",
+    ),
+    (
+        ("multa", "punição", "penalidade", "infração", "infringindo", "infringir"),
+        "sanções administrativas multa simples faturamento infração Art. 52 dosimetria",
+    ),
+]
+
+
+def expand_colloquial_legal_terms(query: str) -> str:
+    """
+    Enriquece instantaneamente (0ms, sem chamada de LLM) perguntas abertas/coloquiais
+    com os termos técnicos equivalentes da LGPD e ANPD para maximizar a precisão
+    da busca híbrida (BM25 + ChromaDB) quando o usuário não cita números de artigos.
+    """
+    q_lower = query.lower()
+    # Se a pergunta já menciona um número de artigo (ex: "Art. 7º", "artigo 46"), mantém inalterada
+    if re.search(r"\bart(?:igo)?\.?\s*\d", q_lower):
+        return query
+
+    expansions: List[str] = []
+    for triggers, legal_terms in COLLOQUIAL_TO_LEGAL_MAP:
+        if any(t in q_lower for t in triggers):
+            expansions.append(legal_terms)
+
+    if not expansions:
+        return query
+    return f"{query} ({' '.join(expansions)})"
+
+
 class LGPDRagEngine:
     """
     Motor RAG Híbrido (ChromaDB Cosine + BM25 via RRF) com Expansão Automática de Referências Cruzadas
@@ -109,6 +162,7 @@ class LGPDRagEngine:
         self.chunks_by_id: Dict[str, Dict[str, Any]] = {}
         self.bm25: Optional[BM25Okapi] = None
         self._active_embedding_model: Optional[str] = None
+        self._active_generation_model: Optional[str] = None
         self._using_fallback_embeddings: bool = False
         self._embedding_cache: Dict[str, List[float]] = {}
         self._load_local_chunks_and_bm25()
@@ -382,19 +436,21 @@ class LGPDRagEngine:
         config: types.GenerateContentConfig,
     ) -> Tuple[Any, str]:
         """
-        Executa client.models.generate_content priorizando a geração Gemini 3.x / Flash
-        com retry exponencial e failover automático contra erros 404 e 503 UNAVAILABLE / 429.
+        Executa client.models.generate_content priorizando modelos rápidos da família Flash
+        (com cache de endpoint ativo e thinking_budget=0) para baixa latência mesmo em
+        perguntas abertas/cenários práticos, além de failover contra 404 e 503/429.
         """
         fallback_chain = [
+            self._active_generation_model or "",
             preferred_model,
+            "gemini-2.5-flash",
             "gemini-3-flash-preview",
             "gemini-3.1-flash-preview",
             "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
-            "gemini-3.1-pro-preview",
             "gemini-flash-latest",
             "gemini-flash-lite-latest",
+            "gemini-3.1-pro-preview",
         ]
         candidates: List[str] = []
         for m in fallback_chain:
@@ -412,17 +468,27 @@ class LGPDRagEngine:
                         candidates.append(dm)
 
             for candidate_model in candidates:
-                for attempt in range(3):
+                active_config = config
+                for attempt in range(2):
                     try:
                         resp = client.models.generate_content(
                             model=candidate_model,
                             contents=contents,
-                            config=config,
+                            config=active_config,
                         )
+                        self._active_generation_model = candidate_model
                         return resp, candidate_model
                     except Exception as exc:
                         last_any_exc = exc
                         err_lower = str(exc).lower()
+
+                        # Se um modelo específico não suportar thinking_budget=0, tenta imediatamente sem thinking_config
+                        if "thinking" in err_lower and getattr(active_config, "thinking_config", None) is not None:
+                            active_config = types.GenerateContentConfig(
+                                temperature=getattr(config, "temperature", 0.1),
+                                system_instruction=getattr(config, "system_instruction", None),
+                            )
+                            continue
 
                         # Modelo inexistente ou descontinuado (404): avança imediatamente sem sobrescrever erro 503
                         if (
@@ -431,12 +497,12 @@ class LGPDRagEngine:
                             or "no longer available" in err_lower
                         ):
                             logger.info(
-                                "Modelo %s indisponível no endpoint (404); tentando próximo da família Gemini 3/Flash.",
+                                "Modelo %s indisponível no endpoint (404); tentando próximo da família Gemini Flash.",
                                 candidate_model,
                             )
                             break
 
-                        # Pico de demanda temporária (503 UNAVAILABLE / 429)
+                        # Pico de demanda temporária (503 UNAVAILABLE / 429): retry curto (0.8s) e failover imediato
                         if any(
                             code in err_lower
                             for code in (
@@ -452,10 +518,10 @@ class LGPDRagEngine:
                             )
                         ):
                             last_transient_exc = exc
-                            if attempt < 2:
-                                wait_s = 1.5 * (attempt + 1)
+                            if attempt < 1:
+                                wait_s = 0.8
                                 logger.warning(
-                                    "Modelo %s com alta demanda (503/429). Tentativa %d/3 em %.1fs...",
+                                    "Modelo %s com alta demanda (503/429). Tentativa %d/2 em %.1fs...",
                                     candidate_model,
                                     attempt + 2,
                                     wait_s,
@@ -463,7 +529,7 @@ class LGPDRagEngine:
                                 time.sleep(wait_s)
                                 continue
                             logger.warning(
-                                "Modelo %s permaneceu ocupado; realizando failover para próximo modelo disponível.",
+                                "Modelo %s permaneceu ocupado; realizando failover rápido para próximo modelo Flash.",
                                 candidate_model,
                             )
                             break
@@ -479,10 +545,10 @@ class LGPDRagEngine:
 
     @staticmethod
     def _needs_query_rewrite(query: str) -> bool:
-        """Verifica se a pergunta depende do contexto anterior (pronomes ou pergunta curta ambígua)."""
+        """Verifica se a pergunta depende estritamente do contexto anterior (pronomes anafóricos ou muito curta)."""
         q_clean = query.strip().lower()
         words = q_clean.split()
-        if len(words) <= 5:
+        if len(words) <= 4:
             return True
         ambiguous_markers = (
             " isso",
@@ -493,7 +559,6 @@ class LGPDRagEngine:
             " nesta hipótese",
             " nessa hipótese",
             " e qual a multa",
-            " e se ",
             " sobre ele",
             " sobre ela",
             " esse artigo",
@@ -539,7 +604,10 @@ class LGPDRagEngine:
                 client=client,
                 preferred_model=model_name or DEFAULT_GENERATION_MODEL,
                 contents=rewrite_prompt,
-                config=types.GenerateContentConfig(temperature=0.1),
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                ),
             )
             rewritten = (resp.text or "").strip()
             return rewritten if rewritten else query.strip()
@@ -572,15 +640,18 @@ class LGPDRagEngine:
                 "A coleção do ChromaDB está vazia. Sincronize e indexe a base primeiro."
             )
 
+        # Expande termos coloquiais para vocabulário jurídico-normativo da LGPD (0ms, local)
+        search_query = expand_colloquial_legal_terms(query)
+
         # 1. Ranking Vetorial no ChromaDB (task_type="RETRIEVAL_QUERY")
         if use_mock_embeddings:
-            query_emb = self._deterministic_test_embedding(query, dim=128)
+            query_emb = self._deterministic_test_embedding(search_query, dim=128)
         elif self._using_fallback_embeddings:
-            query_emb = self._deterministic_test_embedding(query, dim=768)
+            query_emb = self._deterministic_test_embedding(search_query, dim=768)
         else:
             try:
                 query_emb = self._embed_texts(
-                    [query],
+                    [search_query],
                     task_type="RETRIEVAL_QUERY",
                     api_key=api_key,
                 )[0]
@@ -590,7 +661,7 @@ class LGPDRagEngine:
                     logger.warning(
                         "Cota Free Tier de embeddings (429) atingida na query; utilizando contingência vetorial local + BM25."
                     )
-                    query_emb = self._deterministic_test_embedding(query, dim=768)
+                    query_emb = self._deterministic_test_embedding(search_query, dim=768)
                 else:
                     raise
 
@@ -607,7 +678,7 @@ class LGPDRagEngine:
                 exc,
             )
             self._using_fallback_embeddings = True
-            query_emb = self._deterministic_test_embedding(query, dim=768)
+            query_emb = self._deterministic_test_embedding(search_query, dim=768)
             chroma_res = None
 
         vector_ranks: Dict[str, int] = {}
@@ -627,7 +698,7 @@ class LGPDRagEngine:
         bm25_ranks: Dict[str, int] = {}
         bm25_scores_map: Dict[str, float] = {}
         if self.bm25 is not None and self.chunks:
-            query_tokens = tokenize_pt(query)
+            query_tokens = tokenize_pt(search_query)
             raw_scores = self.bm25.get_scores(query_tokens)
             scored_indices = sorted(
                 enumerate(raw_scores), key=lambda x: x[1], reverse=True
@@ -789,6 +860,7 @@ class LGPDRagEngine:
             model_name=model_name,
             api_key=api_key,
         )
+        rewritten_query = expand_colloquial_legal_terms(rewritten_query)
 
         retrieved_chunks = self.hybrid_search_with_cross_ref(
             query=rewritten_query,
@@ -811,6 +883,7 @@ class LGPDRagEngine:
         gen_config = types.GenerateContentConfig(
             temperature=0.1,
             system_instruction=SYSTEM_INSTRUCTION,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
 
         selected_model = DEFAULT_GENERATION_MODEL
