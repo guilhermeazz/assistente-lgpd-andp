@@ -17,10 +17,15 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
+
+# Evita contenção de threads OpenMP entre PyTorch (SentenceTransformers) e ONNXRuntime (FlashRank) em CPU Windows
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 
 import chromadb
 from rank_bm25 import BM25Okapi
@@ -64,6 +69,7 @@ SYSTEM_INSTRUCTION = SYSTEM_PROMPT
 # Singletons em memória para evitar recarregamento de modelos a cada consulta
 _LOCAL_EMBEDDER_CACHE: Dict[str, Any] = {}
 _LOCAL_RERANKER_CACHE: Dict[str, Any] = {}
+_TEXT_EMBEDDING_CACHE: Dict[str, List[float]] = {}
 
 
 def tokenize_pt(text: str) -> List[str]:
@@ -84,7 +90,13 @@ def get_local_embedder(model_name: str = LOCAL_EMBEDDING_MODEL) -> Any:
     (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`).
     """
     if model_name not in _LOCAL_EMBEDDER_CACHE:
+        import torch
         from sentence_transformers import SentenceTransformer
+
+        try:
+            torch.set_num_threads(2)
+        except Exception:
+            pass
 
         LOCAL_MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_dir = str(LOCAL_MODELS_CACHE_DIR)
@@ -106,25 +118,45 @@ def get_local_embedder(model_name: str = LOCAL_EMBEDDING_MODEL) -> Any:
 def get_local_reranker(
     model_name: str = FLASHRANK_MODEL,
     cache_dir: str = FLASHRANK_CACHE_DIR,
-    max_length: int = 96,
+    max_length: int = 32,
 ) -> Optional[Any]:
     """
     Carrega e mantém em cache singleton o Cross-Encoder ONNX do FlashRank
-    (`ms-marco-MultiBERT-L-12` em `./.cache/flashrank` com `max_length=96` para inferência < 150ms).
-    Em caso de falha de rede no primeiro download, retorna None para acionar fallback seguro ao RRF.
+    (`ms-marco-MultiBERT-L-12` em `./.cache/flashrank` com `max_length=64` e `intra_op_num_threads=2`
+    para eliminar contenção de threads OpenMP entre ONNXRuntime e PyTorch em CPU).
     """
     cache_key = f"{model_name}::{cache_dir}::{max_length}"
     if cache_key not in _LOCAL_RERANKER_CACHE:
         try:
+            import onnxruntime as ort
             from flashrank import Ranker
 
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
             logger.info("Inicializando FlashRank Ranker local: %s (%s)", model_name, cache_dir)
-            _LOCAL_RERANKER_CACHE[cache_key] = Ranker(
-                model_name=model_name,
-                cache_dir=cache_dir,
-                max_length=max_length,
-            )
+
+            orig_session_cls = ort.InferenceSession
+
+            def _tuned_inference_session(path_or_bytes: Any, *args: Any, **kwargs: Any) -> Any:
+                if "sess_options" not in kwargs:
+                    opts = ort.SessionOptions()
+                    opts.intra_op_num_threads = 2
+                    opts.inter_op_num_threads = 1
+                    kwargs["sess_options"] = opts
+                if "providers" not in kwargs:
+                    kwargs["providers"] = ["CPUExecutionProvider"]
+                return orig_session_cls(path_or_bytes, *args, **kwargs)
+
+            ort.InferenceSession = _tuned_inference_session  # type: ignore[misc]
+            try:
+                ranker = Ranker(
+                    model_name=model_name,
+                    cache_dir=cache_dir,
+                    max_length=max_length,
+                )
+            finally:
+                ort.InferenceSession = orig_session_cls  # type: ignore[misc]
+
+            _LOCAL_RERANKER_CACHE[cache_key] = ranker
         except Exception as exc:
             logger.warning(
                 "FlashRank indisponível (%s); operando com fallback transparente para RRF.",
@@ -291,14 +323,18 @@ class LGPDRagEngine:
             return [self._deterministic_test_embedding(t, dim=384) for t in texts]
 
         try:
-            embedder = self._get_embedder()
-            vectors = embedder.encode(
-                texts,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )
-            return [vec.tolist() for vec in vectors]
+            missing = [t for t in texts if t not in _TEXT_EMBEDDING_CACHE]
+            if missing:
+                embedder = self._get_embedder()
+                vectors = embedder.encode(
+                    missing,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                )
+                for t_str, vec in zip(missing, vectors):
+                    _TEXT_EMBEDDING_CACHE[t_str] = vec.tolist()
+            return [_TEXT_EMBEDDING_CACHE[t] for t in texts]
         except Exception as exc:
             logger.warning(
                 "Modelo SentenceTransformer indisponível no momento (%s); ativando embedding local determinístico 384-d.",
@@ -485,12 +521,12 @@ class LGPDRagEngine:
                 passages = [
                     {
                         "id": item["id"],
-                        "text": item["texto"][:260],
+                        "text": item["texto"][:90],
                         "meta": item["metadata"],
                     }
                     for item in candidates
                 ]
-                rerank_req = RerankRequest(query=original_query[:160], passages=passages)
+                rerank_req = RerankRequest(query=original_query[:65], passages=passages)
                 reranked_raw = reranker.rerank(rerank_req)
 
                 raw_score_by_id: Dict[str, float] = {

@@ -30,6 +30,7 @@ from src.rag.providers import (
     AnthropicProvider,
     BaseLLMProvider,
     GeminiProvider,
+    HuggingFaceQwenProvider,
     LLMProviderFactory,
     OllamaProvider,
     OpenAIProvider,
@@ -58,11 +59,21 @@ class DummyStreamProvider(BaseLLMProvider):
 
 
 def test_provider_factory_initializes_all_four_providers() -> None:
-    """Valida a inicialização correta dos 4 provedores via Factory com temperature=0.1."""
+    """Valida a inicialização correta dos provedores via Factory (incluindo Qwen Local e Qwen Hugging Face GPU) com temperature=0.1."""
     p_ollama = LLMProviderFactory.create("Qwen (Local - Ollama) [Padrão]", model_name="qwen2.5:7b")
     assert isinstance(p_ollama, OllamaProvider)
     assert p_ollama.model_name == "qwen2.5:7b"
     assert p_ollama.temperature == 0.1
+
+    p_hf = create_llm_provider(
+        "Qwen (Hugging Face GPU - Sem Chave)",
+        model_name="Qwen/Qwen2.5-72B-Instruct",
+        api_key="hf_test_system_token",
+    )
+    assert isinstance(p_hf, HuggingFaceQwenProvider)
+    assert p_hf.model_name == "Qwen/Qwen2.5-72B-Instruct"
+    assert p_hf.api_key == "hf_test_system_token"
+    assert p_hf.temperature == 0.1
 
     p_gemini = create_llm_provider("Google Gemini (API Key)", model_name="gemini-2.5-flash", api_key="test-gemini-key")
     assert isinstance(p_gemini, GeminiProvider)

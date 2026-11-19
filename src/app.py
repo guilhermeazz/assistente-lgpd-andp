@@ -47,11 +47,13 @@ from src.rag.providers import (
     ANTHROPIC_MODELS,
     DEFAULT_OLLAMA_URL,
     GEMINI_MODELS,
+    HF_QWEN_MODELS,
     OLLAMA_MODELS,
     OPENAI_MODELS,
     PROVIDER_DEFAULT_MODELS,
     PROVIDER_LABELS,
     check_ollama_status,
+    get_configured_hf_token,
     normalize_provider_key,
 )
 
@@ -414,7 +416,7 @@ def _inject_lix_inspired_css() -> None:
 
 
 def _init_session_state() -> None:
-    """Inicializa variáveis de sessão para arquitetura Multi-Provedor (Local + BYOK)."""
+    """Inicializa variáveis de sessão para arquitetura Multi-Provedor (Qwen Local Padrão + Qwen HF GPU Sem Chave + Cloud BYOK)."""
     if "provider_key" not in st.session_state:
         st.session_state["provider_key"] = "ollama"
     if "selected_model" not in st.session_state:
@@ -607,6 +609,7 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
     provider_key = st.session_state["provider_key"]
     active_model = st.session_state["selected_model"]
     active_api_key = st.session_state["api_keys"].get(provider_key, "")
+    hf_system_token = get_configured_hf_token()
 
     if provider_key == "ollama":
         ollama_info = check_ollama_status(
@@ -617,8 +620,16 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
             status_badge = f"🟢 Ollama Local Online ({active_model})"
         elif ollama_info["online"]:
             status_badge = f"🟡 Ollama Ativo (falta pull {active_model})"
+        elif hf_system_token:
+            status_badge = "🟢 Qwen Cloud GPU (Failover HF Ativo)"
         else:
             status_badge = "🟠 Ollama Local Offline"
+    elif provider_key == "huggingface":
+        status_badge = (
+            f"🟢 Qwen GPU Hugging Face ({active_model.split('/')[-1]})"
+            if hf_system_token
+            else "🟠 Aguardando HF_TOKEN nos Secrets"
+        )
     else:
         status_badge = (
             f"🟢 API Key ({provider_key.upper()})"
@@ -751,11 +762,19 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
         with st.chat_message("user", avatar="🧑‍💼"):
             st.markdown(active_question)
 
-        if provider_key != "ollama" and not active_api_key:
+        if provider_key in ("gemini", "openai", "anthropic") and not active_api_key:
             with st.chat_message("assistant", avatar="🛡️"):
                 st.warning(
                     f"🔑 **Autenticação BYOK Necessária:** Insira sua API Key para **{PROVIDER_LABELS[provider_key]}** na barra lateral esquerda, "
-                    "ou selecione **Qwen (Local - Ollama) [Padrão]** para rodar 100% localmente sem chave."
+                    "ou selecione **Qwen (Hugging Face GPU - Sem Chave)** / **Qwen (Local - Ollama) [Padrão]** para usar sem chave."
+                )
+            return
+
+        if provider_key == "huggingface" and not hf_system_token:
+            with st.chat_message("assistant", avatar="🛡️"):
+                st.warning(
+                    "☁️ **Configuração do Deploy Necessária:** Adicione `HF_TOKEN = \"hf_...\"` nos **Secrets** do Streamlit Cloud "
+                    "(ou `.streamlit/secrets.toml` local) para habilitar o Qwen nas GPUs do Hugging Face para todos os usuários."
                 )
             return
 
@@ -764,11 +783,11 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
                 base_url=st.session_state["ollama_base_url"],
                 model_name=active_model,
             )
-            if not st_check["online"]:
+            if not st_check["online"] and not hf_system_token:
                 with st.chat_message("assistant", avatar="🛡️"):
                     st.warning(f"⚠️ **Ollama Local Offline:** {st_check['message']}")
                 return
-            if not st_check["model_ready"]:
+            if st_check["online"] and not st_check["model_ready"] and not hf_system_token:
                 with st.chat_message("assistant", avatar="🛡️"):
                     st.warning(f"📥 **Modelo Qwen Ausente no Ollama:** {st_check['message']}")
                 return
@@ -981,8 +1000,30 @@ def _render_sidebar_provider_controls() -> None:
             st.success(status["message"])
         elif status["online"]:
             st.warning(status["message"])
+        elif get_configured_hf_token():
+            st.info(
+                "☁️ Ollama local não detectado neste servidor. "
+                "Failover automático para **Qwen (Hugging Face GPU)** ativado via `HF_TOKEN` do Streamlit!"
+            )
         else:
             st.info(status["message"])
+
+    elif provider_key == "huggingface":
+        st.session_state["selected_model"] = st.selectbox(
+            "Modelo Qwen (GPUs Hugging Face)",
+            options=HF_QWEN_MODELS,
+            index=0,
+            help="Executado nas GPUs da Hugging Face Inference API usando a chave configurada no Streamlit Secrets.",
+        )
+        if get_configured_hf_token():
+            st.success(
+                "✅ **Acesso Liberado (Sem Chave):** Autenticado automaticamente via `HF_TOKEN` do sistema no Streamlit."
+            )
+        else:
+            st.warning(
+                "⚙️ Configure `HF_TOKEN = \"hf_...\"` nos **Secrets do Streamlit** (ou `.streamlit/secrets.toml`) "
+                "para liberar o uso gratuito sem pedir chave ao usuário."
+            )
 
     elif provider_key == "gemini":
         st.session_state["selected_model"] = st.selectbox(
