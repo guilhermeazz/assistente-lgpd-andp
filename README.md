@@ -1,27 +1,23 @@
 # 🛡️ Assistente Inteligente de Conformidade LGPD & ANPD
 
-Sistema completo de **RAG (Retrieval-Augmented Generation) Híbrido** com **Expansão Automática de Referências Cruzadas** para consulta jurídica e regulatória sobre a **Lei Geral de Proteção de Dados Pessoais (Lei nº 13.709/2018 - LGPD)** e **Resoluções/Guias da ANPD**.
+Sistema completo de **RAG (Retrieval-Augmented Generation) Híbrido de Baixa Latência** com **Arquitetura Multi-Provedor (Local + Cloud BYOK)** e **Expansão Automática de Referências Cruzadas** para consulta jurídica e regulatória sobre a **Lei Geral de Proteção de Dados Pessoais (Lei nº 13.709/2018 - LGPD)** e **Resoluções/Guias da ANPD**.
 
 ---
 
 ## 🏗️ Arquitetura e Especificações Técnicas
 
-- **SDK Oficial do Gemini:** Utiliza exclusivamente `google-genai` (`from google import genai` e `from google.genai import types`).
-- **Autenticação BYOK (Bring Your Own Key):** Nenhuma chave hardcoded. A `Gemini API Key` é solicitada na barra lateral do Streamlit, armazenada apenas em `st.session_state` e injetada dinamicamente em `genai.Client(api_key=user_key)`.
-- **Modelos de Geração e Embeddings:**
-  - Geração: Seleção em tempo real entre `gemini-3.8-flash` e `gemini-2.5-flash` com `temperature=0.1`.
-  - Embeddings: `text-embedding-004` com `types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")` na indexação e `task_type="RETRIEVAL_QUERY"` na busca.
-- **Coleta Resiliente (`src/ingestion/fetcher.py`):**
-  - Download da LGPD Compilada direto do Planalto (`iso-8859-1` convertido para `UTF-8`) e de Resoluções/Guias da ANPD em PDF.
-  - Verificação de integridade via hash `SHA-256` (só reescreve arquivos alterados).
-  - **Fallback Local Obrigatório:** Tolerante a bloqueios de WAF/SSL do `gov.br`.
-- **Parser Semântico-Estrutural (`src/ingestion/parser.py`):**
-  - **LGPD (HTML):** Remove tags `<strike>`, `<s>`, `<del>` e elementos CSS `line-through` (trechos revogados/vetados). Preserva cada artigo (`Art. 1º` a `Art. 65`, incluindo `Art. 55-A` a `Art. 55-L` e `Art. 58-A`/`58-B`) como um chunk atômico com Breadcrumb `[Lei nº 13.709/2018 (LGPD) | {capitulo} | {secao} | {artigo}]` e metadado `artigos_citados`.
-  - **ANPD (PDFs):** Extração em Markdown por página via `pymupdf4llm.to_markdown(pdf_path, page_chunks=True)` preservando tabelas regulatórias, segmentado em chunks de ~1800 caracteres (overlap de 250) com Breadcrumb `[Nome do Documento ANPD | Página X]`.
-- **Motor RAG Híbrido + Cross-Reference (`src/rag/engine.py`):**
-  - Reescrita de query ambígua com base no histórico de chat.
-  - **Reciprocal Rank Fusion (RRF):** Combina busca vetorial no `ChromaDB` (métrica `cosine`) com busca lexical `rank-bm25` (`BM25Okapi`).
-  - **Expansão Automática de Referência Cruzada:** Busca no ChromaDB por filtro de metadado até 2 artigos complementares citados no campo `artigos_citados` dos chunks Top-K.
+- **Embeddings 100% Locais (`SentenceTransformers`):**
+  - Utiliza `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-d Cosine) rodando localmente.
+  - **Indexação Única e Independente de Provedor:** O ChromaDB é indexado uma única vez localmente e funciona com qualquer LLM selecionada (Qwen Local, Gemini, ChatGPT ou Claude), reduzindo o tempo de vetorização de queries para milissegundos.
+- **Arquitetura Multi-Provedor (`src/rag/providers.py` — Strategy/Factory):**
+  1. **`OllamaProvider` (Padrão - 100% Local/Offline):** Conecta ao servidor local Ollama (`http://localhost:11434`) com suporte pré-configurado para `qwen2.5:7b` (padrão), `qwen2.5:3b` (modo ultra-rápido), `qwen2.5:14b` ou qualquer tag local customizada, além de diagnóstico automático (`check_ollama_status()`).
+  2. **`GeminiProvider` (BYOK):** Utiliza exclusivamente o SDK oficial `google-genai` (`client.models.generate_content_stream`) com `gemini-2.5-flash`, `gemini-3.8-flash` e `gemini-2.0-flash`.
+  3. **`OpenAIProvider` (BYOK):** Utiliza o SDK oficial `openai` (`client.chat.completions.create(..., stream=True)`) com `gpt-4o-mini`, `gpt-4o` e `o3-mini`.
+  4. **`AnthropicProvider` (BYOK):** Utiliza o SDK oficial `anthropic` (`client.messages.stream(...)`) com `claude-3-5-haiku-latest` e `claude-sonnet-4-20250514`.
+- **Otimizações de Latência no Motor RAG (`src/rag/engine.py`):**
+  - **Streaming de Ponta a Ponta (`ask_stream`):** Retorna imediatamente os metadados/fontes recuperadas e um gerador (`Generator`) de tokens para renderização em tempo real via `st.write_stream`, medindo **Recuperação (ms)** e **TTFT (Time To First Token)**.
+  - **Reescrita Condicional de Query:** Ignora chamadas extras de LLM quando o histórico está vazio ou quando a pergunta possui 5+ palavras sem pronomes referenciais ambíguos (`ele`, `ela`, `disso`, `desse`, `nisso`, `esse artigo`, `essa lei`). Quando necessária, utiliza `max_tokens=40`.
+  - **Orçamento Enxuto de Contexto (*Context Budget*):** `top_k=4` chunks via RRF (`ChromaDB Cosine` + `BM25Okapi`) + até `1` artigo complementar por referência cruzada (`artigos_citados`).
 
 ---
 
@@ -40,11 +36,13 @@ assistente_lgpd/
 │   │   └── parser.py         # Chunking Semântico-Estrutural (HTML Planalto + PDFs em Markdown)
 │   ├── rag/
 │   │   ├── __init__.py
-│   │   └── engine.py         # Indexação, Busca Híbrida (Chroma + BM25), Expansor de Artigos e Geração
-│   └── app.py                # Interface Streamlit com Chat, Upload de PDFs e Auditoria de Fontes
+│   │   ├── providers.py      # Strategy/Factory Multi-Provedor (Ollama/Qwen, Gemini, OpenAI, Anthropic)
+│   │   └── engine.py         # Embeddings locais, Busca Híbrida RRF, Cross-Ref e Streaming (ask_stream)
+│   └── app.py                # Interface Streamlit com Cache (@st.cache_resource), Streaming e Telemetria TTFT
 ├── tests/
-│   └── test_pipeline.py      # Testes automatizados do Parser (incluindo Art. 55-A a 55-L) e Retrieval
-├── requirements.txt          # google-genai, chromadb, pymupdf, pymupdf4llm, beautifulsoup4, rank-bm25, requests, streamlit, pytest
+│   ├── test_pipeline.py      # Testes automatizados do Parser (incluindo Art. 55-A a 55-L) e Retrieval
+│   └── test_performance.py   # Testes de performance (< 500ms), Factory Multi-Provedor e Streaming
+├── requirements.txt
 └── README.md
 ```
 
@@ -58,18 +56,12 @@ assistente_lgpd/
 pip install -r requirements.txt
 ```
 
-### 2. Executar Coleta e Parsing
+### 2. Executar os Testes Automatizados (Pipeline + Performance)
 ```powershell
-.\.venv\Scripts\python.exe src/ingestion/fetcher.py
-.\.venv\Scripts\python.exe src/ingestion/parser.py
+.\.venv\Scripts\pytest.exe tests/test_pipeline.py tests/test_performance.py -v
 ```
 
-### 3. Executar os Testes Automatizados
-```powershell
-.\.venv\Scripts\pytest.exe tests/test_pipeline.py -v
-```
-
-### 4. Iniciar a Interface Conversacional (Streamlit)
+### 3. Iniciar a Interface Conversacional (Streamlit)
 ```powershell
 .\.venv\Scripts\streamlit.exe run src/app.py
 ```

@@ -1,15 +1,14 @@
 """
-Motor RAG Híbrido com Expansão Automática de Referências Cruzadas (src/rag/engine.py)
+Motor RAG Híbrido em Dois Estágios (Retrieve & Rerank) com Expansor Jurídico e Multi-Provedor (src/rag/engine.py)
 Implementa:
-- Uso exclusivo do SDK oficial `google-genai` (`from google import genai` e `from google.genai import types`)
-- Autenticação BYOK dinâmica (`genai.Client(api_key=user_key)`)
-- Embeddings com `text-embedding-004` (`RETRIEVAL_DOCUMENT` na indexação e `RETRIEVAL_QUERY` na busca)
-- Indexação vetorial no ChromaDB com métrica `cosine`
-- Busca lexical com `rank_bm25` (`BM25Okapi`)
-- Fusão de rankings via Reciprocal Rank Fusion (RRF)
-- Expansão automática de até 2 artigos citados (`artigos_citados`) via filtro de metadado no ChromaDB
-- Reescrita de query contextualizada com histórico do chat
-- Geração estruturada com `temperature=0.1` e System Instruction restritivo ao `<contexto_normativo>`
+- Expansor Determinístico de Sinônimos Jurídicos (~0 ms): `expand_legal_query` (`src/rag/legal_expander.py`)
+- Estágio 1 (Hybrid Recall): Embeddings locais (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`)
+  no ChromaDB (métrica `cosine`) + `BM25Okapi` via Reciprocal Rank Fusion (RRF) recuperando `top_n = 10` candidatos
+- Estágio 2 (Precision Reranking): Cross-Encoder local ONNX via `flashrank.Ranker(model_name="ms-marco-MultiBERT-L-12", cache_dir="./.cache/flashrank")`
+  selecionando os `top_k = 4` chunks mais relevantes + fallback transparente para RRF
+- Expansão enxuta de referência cruzada: até `1` artigo complementar (`artigos_citados`)
+- System Prompt interpretativo, visual e com One-Shot (`src/rag/prompts.py`)
+- Streaming de ponta a ponta via `ask_stream(question, history, top_k=4)` compatível com `st.write_stream`
 """
 
 from __future__ import annotations
@@ -21,12 +20,20 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 
 import chromadb
-from google import genai
-from google.genai import types
 from rank_bm25 import BM25Okapi
+
+from src.rag.legal_expander import expand_legal_query, extract_anchor_articles
+from src.rag.prompts import SYSTEM_PROMPT
+from src.rag.providers import (
+    DEFAULT_OLLAMA_URL,
+    DEFAULT_TEMPERATURE,
+    PROVIDER_DEFAULT_MODELS,
+    BaseLLMProvider,
+    LLMProviderFactory,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -37,28 +44,26 @@ logging.basicConfig(
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS_PATH = PROJECT_ROOT / "data" / "processed" / "chunks_lgpd.jsonl"
 DEFAULT_CHROMA_DIR = PROJECT_ROOT / "data" / "processed" / "chroma_db"
+LOCAL_MODELS_CACHE_DIR = PROJECT_ROOT / "data" / "models_cache"
 COLLECTION_NAME = "lgpd_anpd_normas"
 
-EMBEDDING_MODEL = "text-embedding-004"
-DEFAULT_GENERATION_MODEL = "gemini-3.8-flash"
-SUPPORTED_GENERATION_MODELS = ["gemini-3.8-flash"]
+LOCAL_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = LOCAL_EMBEDDING_MODEL
+FLASHRANK_MODEL = "ms-marco-MultiBERT-L-12"
+FLASHRANK_CACHE_DIR = "./.cache/flashrank"
 
-SYSTEM_INSTRUCTION = """Você é o Assistente Inteligente de Conformidade LGPD & ANPD, um especialista jurídico-regulatório em Proteção de Dados Pessoais no Brasil.
+DEFAULT_PROVIDER = "ollama"
+DEFAULT_GENERATION_MODEL = PROVIDER_DEFAULT_MODELS[DEFAULT_PROVIDER]
+DEFAULT_TOP_N_CANDIDATES = 10
+DEFAULT_TOP_K = 4
+DEFAULT_MAX_CROSS_REFS = 1
 
-REGRAS ESTRITAS DE GROUNDING:
-1. Responda EXCLUSIVAMENTE com base nas informações contidas dentro da tag <contexto_normativo> fornecida.
-2. NÃO invente artigos, incisos, parágrafos, prazos, alíquotas ou interpretações que não estejam amparados no <contexto_normativo>.
-3. Se a informação solicitada não constar no <contexto_normativo>, declare expressamente que não há base suficiente nos trechos recuperados.
-4. Formate OBRIGATORIAMENTE toda resposta nas três seções numeradas abaixo:
+# Retrocompatibilidade com importações existentes
+SYSTEM_INSTRUCTION = SYSTEM_PROMPT
 
-### 1. Resumo Direto
-Síntese clara, objetiva e executiva respondendo diretamente à dúvida do usuário.
-
-### 2. Fundamentação Normativa Exata
-Citação precisa dos dispositivos legais e regulatórios presentes no <contexto_normativo>, indicando expressamente o Artigo, Inciso, Alínea, Parágrafo da Lei nº 13.709/2018 (LGPD) e/ou o Nome e a Página da Resolução/Guia da ANPD, incluindo as referências cruzadas aplicáveis.
-
-### 3. Implicação Prática / Checklist de Conformidade
-Lista acionável (checklist em bullet points) com as medidas práticas de governança, segurança ou adequação que o Controlador, Operador ou Encarregado (DPO) deve adotar."""
+# Singletons em memória para evitar recarregamento de modelos a cada consulta
+_LOCAL_EMBEDDER_CACHE: Dict[str, Any] = {}
+_LOCAL_RERANKER_CACHE: Dict[str, Any] = {}
 
 
 def tokenize_pt(text: str) -> List[str]:
@@ -67,63 +72,87 @@ def tokenize_pt(text: str) -> List[str]:
     return re.findall(r"[a-z0-9áàâãéêíóôõúçº°]+(?:-[a-z0-9]+)?", cleaned)
 
 
-COLLOQUIAL_TO_LEGAL_MAP: List[Tuple[Tuple[str, ...], str]] = [
-    (
-        ("vaza", "vazamento", "vazando", "vazou", "exposto", "invadido", "hacker", "ataque", "acidentalmente", "acidente"),
-        "incidente de segurança acessos não autorizados situações acidentais ou ilícitas comunicação à autoridade nacional Art. 46 Art. 48 Art. 44 Art. 42",
-    ),
-    (
-        ("cpf", "rg", "cnh", "endereço", "telefone", "celular", "email", "e-mail", "cadastro", "usuario", "usuário", "cliente"),
-        "dado pessoal pessoa natural identificada ou identificável titular Art. 5º",
-    ),
-    (
-        ("biometria", "biométrico", "saúde", "doença", "religião", "genético", "facial"),
-        "dado pessoal sensível Art. 5º Art. 11",
-    ),
-    (
-        ("criança", "adolescente", "menor de idade", "menores"),
-        "tratamento de dados pessoais de crianças e de adolescentes Art. 14",
-    ),
-    (
-        ("site", "aplicativo", "app", "sistema", "plataforma", "loja", "empresa"),
-        "controlador operador agentes de tratamento segurança e boas práticas Art. 42 Art. 46",
-    ),
-    (
-        ("apagar", "excluir", "deletar", "descadastrar", "remover"),
-        "direito do titular eliminação término do tratamento revogação do consentimento Art. 18 Art. 15 Art. 16",
-    ),
-    (
-        ("multa", "punição", "penalidade", "infração", "infringindo", "infringir"),
-        "sanções administrativas multa simples faturamento infração Art. 52 dosimetria",
-    ),
-]
-
-
 def expand_colloquial_legal_terms(query: str) -> str:
-    """
-    Enriquece instantaneamente (0ms, sem chamada de LLM) perguntas abertas/coloquiais
-    com os termos técnicos equivalentes da LGPD e ANPD para maximizar a precisão
-    da busca híbrida (BM25 + ChromaDB) quando o usuário não cita números de artigos.
-    """
-    q_lower = query.lower()
-    # Se a pergunta já menciona um número de artigo (ex: "Art. 7º", "artigo 46"), mantém inalterada
-    if re.search(r"\bart(?:igo)?\.?\s*\d", q_lower):
-        return query
+    """Wrapper retrocompatível para `expand_legal_query` retornando apenas a string expandida."""
+    expanded, _ = expand_legal_query(query)
+    return expanded
 
-    expansions: List[str] = []
-    for triggers, legal_terms in COLLOQUIAL_TO_LEGAL_MAP:
-        if any(t in q_lower for t in triggers):
-            expansions.append(legal_terms)
 
-    if not expansions:
-        return query
-    return f"{query} ({' '.join(expansions)})"
+def get_local_embedder(model_name: str = LOCAL_EMBEDDING_MODEL) -> Any:
+    """
+    Carrega e mantém em cache singleton o modelo SentenceTransformer local
+    (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`).
+    """
+    if model_name not in _LOCAL_EMBEDDER_CACHE:
+        from sentence_transformers import SentenceTransformer
+
+        LOCAL_MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_dir = str(LOCAL_MODELS_CACHE_DIR)
+        logger.info("Carregando modelo de embedding local: %s", model_name)
+        try:
+            _LOCAL_EMBEDDER_CACHE[model_name] = SentenceTransformer(
+                model_name,
+                cache_folder=cache_dir,
+                local_files_only=True,
+            )
+        except Exception:
+            _LOCAL_EMBEDDER_CACHE[model_name] = SentenceTransformer(
+                model_name,
+                cache_folder=cache_dir,
+            )
+    return _LOCAL_EMBEDDER_CACHE[model_name]
+
+
+def get_local_reranker(
+    model_name: str = FLASHRANK_MODEL,
+    cache_dir: str = FLASHRANK_CACHE_DIR,
+    max_length: int = 96,
+) -> Optional[Any]:
+    """
+    Carrega e mantém em cache singleton o Cross-Encoder ONNX do FlashRank
+    (`ms-marco-MultiBERT-L-12` em `./.cache/flashrank` com `max_length=96` para inferência < 150ms).
+    Em caso de falha de rede no primeiro download, retorna None para acionar fallback seguro ao RRF.
+    """
+    cache_key = f"{model_name}::{cache_dir}::{max_length}"
+    if cache_key not in _LOCAL_RERANKER_CACHE:
+        try:
+            from flashrank import Ranker
+
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            logger.info("Inicializando FlashRank Ranker local: %s (%s)", model_name, cache_dir)
+            _LOCAL_RERANKER_CACHE[cache_key] = Ranker(
+                model_name=model_name,
+                cache_dir=cache_dir,
+                max_length=max_length,
+            )
+        except Exception as exc:
+            logger.warning(
+                "FlashRank indisponível (%s); operando com fallback transparente para RRF.",
+                exc,
+            )
+            return None
+    return _LOCAL_RERANKER_CACHE.get(cache_key)
+
+
+class StreamAnswerResult(dict):
+    """
+    Estrutura de retorno híbrida de `ask_stream`:
+    - Pode ser desempacotada diretamente como tupla: `metadata, stream = engine.ask_stream(...)`
+    - Ou acessada como dicionário: `res = engine.ask_stream(...); res["stream"]`, `res["retrieved_chunks"]`.
+    """
+
+    def __iter__(self) -> Iterator[Any]:
+        yield dict(self)
+        yield self.get("stream")
 
 
 class LGPDRagEngine:
     """
-    Motor RAG Híbrido (ChromaDB Cosine + BM25 via RRF) com Expansão Automática de Referências Cruzadas
-    e Geração Controlada via SDK oficial `google-genai`.
+    Motor RAG Híbrido em Dois Estágios (Retrieve & Rerank):
+    1. Expansão Determinística de Sinônimos Jurídicos (~0 ms)
+    2. Estágio 1: ChromaDB Cosine (SentenceTransformers Local) + BM25 via RRF (`top_n = 10`)
+    3. Estágio 2: Cross-Encoder Local (`FlashRank ms-marco-MultiBERT-L-12`) selecionando `top_k = 4`
+    4. Expansão de Referência Cruzada limitada a no máximo `1` artigo complementar (`artigos_citados`)
     """
 
     def __init__(
@@ -133,13 +162,19 @@ class LGPDRagEngine:
         chroma_dir: Optional[Path] = DEFAULT_CHROMA_DIR,
         collection_name: str = COLLECTION_NAME,
         in_memory_chroma: bool = False,
+        embedding_model_name: str = LOCAL_EMBEDDING_MODEL,
+        embedder: Optional[Any] = None,
+        reranker: Optional[Any] = None,
     ) -> None:
         self.api_key = (api_key or "").strip()
         self.chunks_path = Path(chunks_path)
         self.chroma_dir = Path(chroma_dir) if chroma_dir else None
         self.collection_name = collection_name
+        self.embedding_model_name = embedding_model_name
+        self._embedder = embedder
+        self._reranker = reranker
+        self._reranker_initialized = reranker is not None
 
-        # Inicializa ChromaDB com métrica cosine obrigatória (com fallback para EphemeralClient em containers Cloud)
         if in_memory_chroma or self.chroma_dir is None:
             self.chroma_client = chromadb.EphemeralClient()
         else:
@@ -148,7 +183,7 @@ class LGPDRagEngine:
                 self.chroma_client = chromadb.PersistentClient(path=str(self.chroma_dir))
             except Exception as exc:
                 logger.warning(
-                    "PersistentClient indisponível no container (%s); utilizando EphemeralClient.",
+                    "PersistentClient indisponível (%s); utilizando EphemeralClient.",
                     exc,
                 )
                 self.chroma_client = chromadb.EphemeralClient()
@@ -161,20 +196,26 @@ class LGPDRagEngine:
         self.chunks: List[Dict[str, Any]] = []
         self.chunks_by_id: Dict[str, Dict[str, Any]] = {}
         self.bm25: Optional[BM25Okapi] = None
-        self._active_embedding_model: Optional[str] = None
-        self._active_generation_model: Optional[str] = None
         self._using_fallback_embeddings: bool = False
-        self._embedding_cache: Dict[str, List[float]] = {}
+        self.last_matched_concepts: List[str] = []
+        self.last_expanded_query: str = ""
         self._load_local_chunks_and_bm25()
 
-    def _get_genai_client(self, api_key: Optional[str] = None) -> genai.Client:
-        """Instancia dinamicamente o cliente oficial google.genai.Client(api_key=user_key)."""
-        key = (api_key or self.api_key or "").strip()
-        if not key:
-            raise ValueError(
-                "Gemini API Key não fornecida. Insira sua chave na barra lateral para autenticar a sessão (BYOK)."
+    def _get_embedder(self) -> Any:
+        """Obtém a instância cacheada do SentenceTransformer local."""
+        if self._embedder is None:
+            self._embedder = get_local_embedder(self.embedding_model_name)
+        return self._embedder
+
+    def _get_reranker(self) -> Optional[Any]:
+        """Obtém a instância cacheada do FlashRank Ranker local (ou None em fallback)."""
+        if not self._reranker_initialized:
+            self._reranker = get_local_reranker(
+                model_name=FLASHRANK_MODEL,
+                cache_dir=FLASHRANK_CACHE_DIR,
             )
-        return genai.Client(api_key=key)
+            self._reranker_initialized = True
+        return self._reranker
 
     def _load_local_chunks_and_bm25(self) -> None:
         """Carrega os chunks do arquivo JSONL e constrói o índice lexical BM25 em memória."""
@@ -191,8 +232,6 @@ class LGPDRagEngine:
                     self.chunks.append(item)
                     self.chunks_by_id[item["id"]] = item
 
-        # Se estiver no ambiente principal (ex: Streamlit Cloud) e a base tiver menos de 65 chunks,
-        # reconstrói automaticamente a base completa (79 artigos LGPD + PDFs ANPD = 82 chunks)
         if self.chunks_path == DEFAULT_CHUNKS_PATH and len(self.chunks) < 65:
             logger.warning(
                 "Base de chunks ausente ou incompleta (%d chunks). Reconstruindo base normativa completa...",
@@ -227,80 +266,9 @@ class LGPDRagEngine:
         except Exception:
             return 0
 
-    def _embed_texts(
-        self,
-        texts: List[str],
-        task_type: str,
-        api_key: Optional[str] = None,
-        batch_size: int = 100,
-    ) -> List[List[float]]:
-        """
-        Gera embeddings usando o modelo `text-embedding-004` via SDK `google-genai`,
-        passando explicitamente `config=types.EmbedContentConfig(task_type=task_type)`.
-        Usa batch_size=100 para enviar os 82 chunks em uma única chamada dentro da cota Free Tier (100/min).
-        """
-        client = self._get_genai_client(api_key=api_key)
-        all_embeddings: List[List[float]] = []
-
-        embed_config = types.EmbedContentConfig(task_type=task_type)
-        model_order = [EMBEDDING_MODEL, "gemini-embedding-001", "gemini-embedding-2-preview"]
-        if self._active_embedding_model and self._active_embedding_model in model_order:
-            model_order.remove(self._active_embedding_model)
-            model_order.insert(0, self._active_embedding_model)
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            response = None
-            last_exc: Optional[Exception] = None
-            for candidate_emb_model in model_order:
-                for attempt in range(2):
-                    try:
-                        response = client.models.embed_content(
-                            model=candidate_emb_model,
-                            contents=batch,
-                            config=embed_config,
-                        )
-                        self._active_embedding_model = candidate_emb_model
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        err_lower = str(exc).lower()
-                        if "not found" in err_lower or "404" in err_lower:
-                            logger.warning(
-                                "Modelo %s indisponível no endpoint da chave; tentando próximo modelo de embedding.",
-                                candidate_emb_model,
-                            )
-                            break
-                        if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
-                            logger.warning(
-                                "Limite de cota Free Tier (429) atingido no modelo %s; tentando modelo alternativo ou contingência.",
-                                candidate_emb_model,
-                            )
-                            break
-                        if any(
-                            transient in err_lower
-                            for transient in ("503", "unavailable", "high demand", "overloaded")
-                        ) and attempt == 0:
-                            time.sleep(1.5)
-                            continue
-                        raise
-                if response is not None:
-                    break
-
-            if response is None and last_exc is not None:
-                raise last_exc
-
-            for emb in response.embeddings:
-                all_embeddings.append(list(emb.values))
-
-        return all_embeddings
-
     @staticmethod
-    def _deterministic_test_embedding(text: str, dim: int = 128) -> List[float]:
-        """
-        Gera vetor determinístico unitário baseado em termos para testes locais ou contingência
-        quando a cota Free Tier (100 RPM) de embeddings estiver temporariamente esgotada (429).
-        """
+    def _deterministic_test_embedding(text: str, dim: int = 384) -> List[float]:
+        """Gera vetor determinístico unitário (384-d) para testes rápidos ou fallback offline."""
         vec = [0.0] * dim
         tokens = tokenize_pt(text)
         for tok in tokens:
@@ -310,6 +278,46 @@ class LGPDRagEngine:
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
 
+    def _embed_texts(
+        self,
+        texts: List[str],
+        use_mock_embeddings: bool = False,
+    ) -> List[List[float]]:
+        """
+        Vetoriza textos localmente em milissegundos usando SentenceTransformers
+        (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`).
+        """
+        if use_mock_embeddings or self._using_fallback_embeddings:
+            return [self._deterministic_test_embedding(t, dim=384) for t in texts]
+
+        try:
+            embedder = self._get_embedder()
+            vectors = embedder.encode(
+                texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            return [vec.tolist() for vec in vectors]
+        except Exception as exc:
+            logger.warning(
+                "Modelo SentenceTransformer indisponível no momento (%s); ativando embedding local determinístico 384-d.",
+                exc,
+            )
+            self._using_fallback_embeddings = True
+            return [self._deterministic_test_embedding(t, dim=384) for t in texts]
+
+    def _recreate_collection(self) -> None:
+        """Recria a coleção do ChromaDB com métrica cosine quando há incompatibilidade de dimensão."""
+        try:
+            self.chroma_client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
     def index_chunks(
         self,
         api_key: Optional[str] = None,
@@ -317,10 +325,9 @@ class LGPDRagEngine:
     ) -> int:
         """
         Indexa todos os chunks de `data/processed/chunks_lgpd.jsonl` no ChromaDB (métrica cosine)
-        utilizando `text-embedding-004` com `task_type="RETRIEVAL_DOCUMENT"`.
-        Se a cota Free Tier de embeddings (100 RPM) retornar 429 RESOURCE_EXHAUSTED, realiza
-        contingência vetorial local automática (768-d cosine) para não bloquear o usuário.
+        usando o modelo local `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
         """
+        _ = api_key
         self._load_local_chunks_and_bm25()
         if not self.chunks:
             raise RuntimeError(
@@ -344,44 +351,11 @@ class LGPDRagEngine:
             for c in self.chunks
         ]
 
-        if use_mock_embeddings:
-            self._using_fallback_embeddings = False
-            embeddings = [self._deterministic_test_embedding(doc, dim=128) for doc in documents]
-        else:
-            try:
-                # Reaproveita embeddings já em cache na sessão para economizar cota Free Tier (100 RPM)
-                missing_indices = [
-                    idx for idx, doc in enumerate(documents) if doc not in self._embedding_cache
-                ]
-                if missing_indices:
-                    missing_docs = [documents[idx] for idx in missing_indices]
-                    computed = self._embed_texts(
-                        missing_docs,
-                        task_type="RETRIEVAL_DOCUMENT",
-                        api_key=api_key,
-                        batch_size=100,
-                    )
-                    for idx, emb_vec in zip(missing_indices, computed):
-                        self._embedding_cache[documents[idx]] = emb_vec
+        embeddings = self._embed_texts(
+            documents,
+            use_mock_embeddings=use_mock_embeddings,
+        )
 
-                embeddings = [self._embedding_cache[doc] for doc in documents]
-                self._using_fallback_embeddings = False
-            except Exception as exc:
-                err_lower = str(exc).lower()
-                if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
-                    logger.warning(
-                        "Cota Free Tier de embeddings (100 RPM) temporariamente atingida (429). "
-                        "Ativando contingência vetorial local (768-d Cosine) + BM25 para indexar os %d chunks sem espera.",
-                        len(documents),
-                    )
-                    self._using_fallback_embeddings = True
-                    embeddings = [
-                        self._deterministic_test_embedding(doc, dim=768) for doc in documents
-                    ]
-                else:
-                    raise
-
-        # Recria a coleção caso a dimensionalidade do embedding mude
         try:
             self.collection.upsert(
                 ids=ids,
@@ -389,12 +363,13 @@ class LGPDRagEngine:
                 metadatas=metadatas,
                 embeddings=embeddings,
             )
-        except Exception:
-            self.chroma_client.delete_collection(self.collection_name)
-            self.collection = self.chroma_client.get_or_create_collection(
-                name=self.collection_name,
-                metadata={"hnsw:space": "cosine"},
+        except Exception as exc:
+            logger.info(
+                "Recriando coleção '%s' devido a mudança de dimensão de embedding (%s)...",
+                self.collection_name,
+                exc,
             )
+            self._recreate_collection()
             self.collection.upsert(
                 ids=ids,
                 documents=documents,
@@ -403,283 +378,229 @@ class LGPDRagEngine:
             )
 
         total = self.collection.count()
-        logger.info("Indexação concluída no ChromaDB: %d chunks indexados.", total)
+        logger.info("Indexação local concluída no ChromaDB: %d chunks indexados.", total)
         return total
-
-    def _discover_available_models(self, client: genai.Client) -> List[str]:
-        """Consulta dinamicamente a API para listar modelos Gemini ativos na chave do usuário."""
-        discovered: List[str] = []
-        try:
-            for m in client.models.list():
-                name = str(getattr(m, "name", "") or "")
-                if name.startswith("models/"):
-                    name = name.split("models/", 1)[1]
-                lower = name.lower()
-                if (
-                    "gemini" in lower
-                    and ("flash" in lower or "pro" in lower)
-                    and not any(
-                        skip in lower
-                        for skip in ("embedding", "vision", "image", "tts", "audio", "live", "1.5", "2.0", "2.5-pro")
-                    )
-                ):
-                    discovered.append(name)
-        except Exception as exc:
-            logger.debug("Não foi possível listar modelos dinamicamente: %s", exc)
-        return discovered
-
-    def _generate_content_resilient(
-        self,
-        client: genai.Client,
-        preferred_model: str,
-        contents: str,
-        config: types.GenerateContentConfig,
-    ) -> Tuple[Any, str]:
-        """
-        Executa client.models.generate_content priorizando modelos rápidos da família Flash
-        (com cache de endpoint ativo e thinking_budget=0) para baixa latência mesmo em
-        perguntas abertas/cenários práticos, além de failover contra 404 e 503/429.
-        """
-        fallback_chain = [
-            self._active_generation_model or "",
-            preferred_model,
-            "gemini-2.5-flash",
-            "gemini-3-flash-preview",
-            "gemini-3.1-flash-preview",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-            "gemini-flash-latest",
-            "gemini-flash-lite-latest",
-            "gemini-3.1-pro-preview",
-        ]
-        candidates: List[str] = []
-        for m in fallback_chain:
-            if m and m not in candidates:
-                candidates.append(m)
-
-        last_transient_exc: Optional[Exception] = None
-        last_any_exc: Optional[Exception] = None
-
-        for pass_idx in range(2):
-            if pass_idx == 1:
-                # Na segunda passagem, adiciona modelos descobertos dinamicamente na conta do usuário
-                for dm in self._discover_available_models(client):
-                    if dm not in candidates:
-                        candidates.append(dm)
-
-            for candidate_model in candidates:
-                active_config = config
-                for attempt in range(2):
-                    try:
-                        resp = client.models.generate_content(
-                            model=candidate_model,
-                            contents=contents,
-                            config=active_config,
-                        )
-                        self._active_generation_model = candidate_model
-                        return resp, candidate_model
-                    except Exception as exc:
-                        last_any_exc = exc
-                        err_lower = str(exc).lower()
-
-                        # Se um modelo específico não suportar thinking_budget=0, tenta imediatamente sem thinking_config
-                        if "thinking" in err_lower and getattr(active_config, "thinking_config", None) is not None:
-                            active_config = types.GenerateContentConfig(
-                                temperature=getattr(config, "temperature", 0.1),
-                                system_instruction=getattr(config, "system_instruction", None),
-                            )
-                            continue
-
-                        # Modelo inexistente ou descontinuado (404): avança imediatamente sem sobrescrever erro 503
-                        if (
-                            "not found" in err_lower
-                            or "404" in err_lower
-                            or "no longer available" in err_lower
-                        ):
-                            logger.info(
-                                "Modelo %s indisponível no endpoint (404); tentando próximo da família Gemini Flash.",
-                                candidate_model,
-                            )
-                            break
-
-                        # Pico de demanda temporária (503 UNAVAILABLE / 429): retry curto (0.8s) e failover imediato
-                        if any(
-                            code in err_lower
-                            for code in (
-                                "503",
-                                "unavailable",
-                                "high demand",
-                                "overloaded",
-                                "429",
-                                "resource_exhausted",
-                                "500",
-                                "502",
-                                "504",
-                            )
-                        ):
-                            last_transient_exc = exc
-                            if attempt < 1:
-                                wait_s = 0.8
-                                logger.warning(
-                                    "Modelo %s com alta demanda (503/429). Tentativa %d/2 em %.1fs...",
-                                    candidate_model,
-                                    attempt + 2,
-                                    wait_s,
-                                )
-                                time.sleep(wait_s)
-                                continue
-                            logger.warning(
-                                "Modelo %s permaneceu ocupado; realizando failover rápido para próximo modelo Flash.",
-                                candidate_model,
-                            )
-                            break
-
-                        # Erros de autenticação/permissão (400/401/403) são propagados imediatamente
-                        raise
-
-        if last_transient_exc is not None:
-            raise last_transient_exc
-        if last_any_exc is not None:
-            raise last_any_exc
-        raise RuntimeError("Não foi possível obter resposta dos modelos Gemini.")
 
     @staticmethod
     def _needs_query_rewrite(query: str) -> bool:
-        """Verifica se a pergunta depende estritamente do contexto anterior (pronomes anafóricos ou muito curta)."""
+        """
+        Regra estrita de baixa latência para reescrita condicional:
+        - NÃO reescreve quando a pergunta tiver 5 ou mais palavras e NÃO contiver pronomes
+          referenciais ambíguos (`ele`, `ela`, `disso`, `desse`, `nisso`, `esse artigo`, `essa lei`).
+        """
         q_clean = query.strip().lower()
-        words = q_clean.split()
-        if len(words) <= 4:
-            return True
-        ambiguous_markers = (
-            " isso",
-            " disso",
-            " nele",
-            " nela",
-            " nesse caso",
-            " nesta hipótese",
-            " nessa hipótese",
-            " e qual a multa",
-            " sobre ele",
-            " sobre ela",
-            " esse artigo",
-            " este artigo",
+        if not q_clean:
+            return False
+
+        ambiguous_pattern = (
+            r"\b(?:ele|ela|eles|elas|disso|desse|dessa|nisso|nesse|nessa|nele|nela|isso)\b"
+            r"|ess[ea]\s+artigo|est[ea]\s+artigo|ess[ea]\s+lei|est[ea]\s+lei"
+            r"|ess[ea]\s+hipótese|ness[ea]\s+hipótese"
         )
-        return any(marker in f" {q_clean} " for marker in ambiguous_markers)
+        if re.search(ambiguous_pattern, q_clean):
+            return True
+
+        words = q_clean.split()
+        if len(words) >= 5:
+            return False
+
+        return True
 
     def rewrite_query_with_history(
         self,
         query: str,
         chat_history: Optional[List[Dict[str, Any]]] = None,
-        model_name: str = DEFAULT_GENERATION_MODEL,
+        provider: Optional[BaseLLMProvider] = None,
+        provider_name: str = DEFAULT_PROVIDER,
+        model_name: Optional[str] = None,
         api_key: Optional[str] = None,
+        base_url: str = DEFAULT_OLLAMA_URL,
     ) -> str:
         """
-        Se houver histórico no chat e a pergunta for ambígua/referencial, reescreve-a
-        em uma query autossuficiente antes da busca híbrida.
+        Reescrita Condicional de Query:
+        - Retorna imediatamente (0ms) quando `chat_history` estiver vazio OU quando a pergunta
+          tiver >= 5 palavras sem pronomes referenciais ambíguos.
+        - Quando realmente necessária, usa prompt curtíssimo com `max_tokens=40`.
         """
         if not chat_history or not self._needs_query_rewrite(query):
             return query.strip()
 
-        recent_turns = chat_history[-4:]
-        history_lines: List[str] = []
-        for msg in recent_turns:
-            role = "Usuário" if msg.get("role") == "user" else "Assistente"
-            content = str(msg.get("content", ""))[:400]
-            history_lines.append(f"{role}: {content}")
-
-        history_str = "\n".join(history_lines)
-        rewrite_prompt = (
-            "Dado o histórico recente de conversa sobre a LGPD (Lei 13.709/2018) e normas da ANPD, "
-            "reescreva a 'Pergunta Atual' em uma única consulta de busca autossuficiente, clara e explícita, "
-            "substituindo pronomes como 'isso', 'ele', 'essa hipótese' pelos termos jurídicos/técnicos do histórico. "
-            "Retorne APENAS a consulta reescrita, sem explicações.\n\n"
-            f"Histórico:\n{history_str}\n\n"
-            f"Pergunta Atual: {query}\n\n"
-            "Consulta Autossuficiente:"
+        recent_turns = chat_history[-2:]
+        history_compact = " | ".join(
+            f"{'U' if m.get('role') == 'user' else 'A'}: {str(m.get('content', ''))[:180]}"
+            for m in recent_turns
         )
 
+        short_system = (
+            "Reescreva a pergunta do usuário tornando-a autossuficiente sobre LGPD/ANPD, "
+            "substituindo pronomes pelo tema do histórico. Retorne APENAS a pergunta curta."
+        )
+        short_user = f"Histórico: {history_compact}\nPergunta: {query}\nReescrita:"
+
         try:
-            client = self._get_genai_client(api_key=api_key)
-            resp, _ = self._generate_content_resilient(
-                client=client,
-                preferred_model=model_name or DEFAULT_GENERATION_MODEL,
-                contents=rewrite_prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                ),
+            active_provider = provider or LLMProviderFactory.create(
+                provider_name=provider_name,
+                model_name=model_name,
+                api_key=api_key or self.api_key,
+                base_url=base_url,
+                temperature=DEFAULT_TEMPERATURE,
             )
-            rewritten = (resp.text or "").strip()
+            rewritten = active_provider.generate(
+                system_prompt=short_system,
+                user_prompt=short_user,
+                max_tokens=40,
+            ).strip()
             return rewritten if rewritten else query.strip()
         except Exception as exc:
-            logger.warning("Falha na reescrita de query, mantendo original: %s", exc)
+            logger.warning("Reescrita condicional ignorada (mantendo query original): %s", exc)
             return query.strip()
+
+    def _rerank_candidates_stage2(
+        self,
+        original_query: str,
+        expanded_query: str,
+        candidates: List[Dict[str, Any]],
+        top_k: int = DEFAULT_TOP_K,
+        use_mock_embeddings: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Estágio 2 — Reordenação de Precisão (Local Cross-Encoder via FlashRank):
+        - Reordena os `top_n = 10` candidatos comparando-os contra a pergunta original do usuário
+          e aplicando boost de ancoragem normativa para artigos-âncora identificados no expansor jurídico.
+        - Em caso de indisponibilidade do modelo ONNX (fallback seguro), preserva os `top_k = 4` do RRF.
+        """
+        if not candidates:
+            return []
+
+        anchor_articles = extract_anchor_articles(expanded_query)
+        anchor_set = set(anchor_articles)
+
+        # Em modo mock de testes unitários ultrarrápidos, evita invocação de ONNX se não carregado
+        reranker = None if use_mock_embeddings else self._get_reranker()
+
+        if reranker is not None:
+            try:
+                from flashrank import RerankRequest
+
+                passages = [
+                    {
+                        "id": item["id"],
+                        "text": item["texto"][:260],
+                        "meta": item["metadata"],
+                    }
+                    for item in candidates
+                ]
+                rerank_req = RerankRequest(query=original_query[:160], passages=passages)
+                reranked_raw = reranker.rerank(rerank_req)
+
+                raw_score_by_id: Dict[str, float] = {
+                    str(r["id"]): float(r.get("score", 0.0)) for r in reranked_raw
+                }
+
+                for item in candidates:
+                    cid = item["id"]
+                    base_ce_score = raw_score_by_id.get(cid, 0.0)
+                    artigo_meta = str(item["metadata"].get("artigo", "")).strip()
+
+                    # Combina score neural do Cross-Encoder com afinidade RRF e ancoragem jurídica determinística
+                    rrf_norm = min(1.0, item.get("rrf_score", 0.0) * 30.0)
+                    combined = 0.65 * base_ce_score + 0.35 * rrf_norm
+
+                    if artigo_meta and artigo_meta in anchor_set:
+                        # Artigos-âncora específicos (ex: Art. 11 para dado sensível) recebem prioridade determinística
+                        anchor_rank_bonus = 0.05 if artigo_meta != "Art. 5º" else 0.02
+                        combined = max(combined, 0.88 + 0.15 * rrf_norm) + anchor_rank_bonus
+
+                    item["raw_rerank_score"] = round(base_ce_score, 4)
+                    item["rerank_score"] = round(min(0.9999, combined), 4)
+                    item["origem"] = "Busca Híbrida RRF + FlashRank Cross-Encoder"
+
+                candidates.sort(
+                    key=lambda x: (x["rerank_score"], x["rrf_score"], x["vector_score"]),
+                    reverse=True,
+                )
+                return candidates[:top_k]
+            except Exception as exc:
+                logger.warning(
+                    "Falha na execução do FlashRank (%s); aplicando fallback transparente para Top-%d do RRF.",
+                    exc,
+                    top_k,
+                )
+
+        # Fallback seguro: utiliza a pontuação do RRF normalizada + artigos-âncora
+        for idx, item in enumerate(candidates):
+            artigo_meta = str(item["metadata"].get("artigo", "")).strip()
+            fallback_score = min(0.95, item.get("rrf_score", 0.0) * 30.0)
+            if artigo_meta and artigo_meta in anchor_set:
+                anchor_bonus = 0.04 if artigo_meta != "Art. 5º" else 0.02
+                fallback_score = max(fallback_score, 0.90 - idx * 0.01) + anchor_bonus
+            item["raw_rerank_score"] = round(fallback_score, 4)
+            item["rerank_score"] = round(min(0.9999, fallback_score), 4)
+
+        candidates.sort(
+            key=lambda x: (x["rerank_score"], x["rrf_score"], x["vector_score"]),
+            reverse=True,
+        )
+        return candidates[:top_k]
 
     def hybrid_search_with_cross_ref(
         self,
         query: str,
-        top_k: int = 5,
-        max_cross_refs: int = 2,
+        top_k: int = DEFAULT_TOP_K,
+        max_cross_refs: int = DEFAULT_MAX_CROSS_REFS,
+        top_n: int = DEFAULT_TOP_N_CANDIDATES,
         rrf_k: int = 60,
         api_key: Optional[str] = None,
         use_mock_embeddings: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Executa a Busca Híbrida (Reciprocal Rank Fusion - RRF) combinando:
-        1. Busca Vetorial no ChromaDB (`RETRIEVAL_QUERY` com métrica `cosine`)
-        2. Busca Lexical via `rank_bm25` (`BM25Okapi`)
-        3. Expansão Automática de Referência Cruzada: busca até `max_cross_refs` (2) artigos
-           mencionados em `artigos_citados` dos chunks Top-K que ainda não estejam na lista.
+        Executa a Busca em Dois Estágios (Retrieve & Rerank) + Expansão de Referência Cruzada:
+        1. Expansão Determinística de Sinônimos Jurídicos (`expand_legal_query`, ~0 ms)
+        2. Estágio 1 (Hybrid Recall): ChromaDB Cosine + BM25 via RRF recuperando `top_n = 10` candidatos
+        3. Estágio 2 (Precision Reranking): `FlashRank (ms-marco-MultiBERT-L-12)` selecionando os `top_k = 4`
+        4. Expansão de Referência Cruzada: até `max_cross_refs = 1` artigo complementar (`artigos_citados`).
         """
+        _ = api_key
         if not self.chunks or self.bm25 is None:
             self._load_local_chunks_and_bm25()
 
         indexed_count = self.get_indexed_count()
         if indexed_count == 0:
-            raise RuntimeError(
-                "A coleção do ChromaDB está vazia. Sincronize e indexe a base primeiro."
-            )
+            self.index_chunks(use_mock_embeddings=use_mock_embeddings)
+            indexed_count = self.get_indexed_count()
 
-        # Expande termos coloquiais para vocabulário jurídico-normativo da LGPD (0ms, local)
-        search_query = expand_colloquial_legal_terms(query)
+        # Etapa 0: Expansão determinística de sinônimos jurídicos (~0 ms)
+        expanded_query, matched_concepts = expand_legal_query(query)
+        self.last_expanded_query = expanded_query
+        self.last_matched_concepts = matched_concepts
+        anchor_articles = extract_anchor_articles(expanded_query)
 
-        # 1. Ranking Vetorial no ChromaDB (task_type="RETRIEVAL_QUERY")
-        if use_mock_embeddings:
-            query_emb = self._deterministic_test_embedding(search_query, dim=128)
-        elif self._using_fallback_embeddings:
-            query_emb = self._deterministic_test_embedding(search_query, dim=768)
-        else:
-            try:
-                query_emb = self._embed_texts(
-                    [search_query],
-                    task_type="RETRIEVAL_QUERY",
-                    api_key=api_key,
-                )[0]
-            except Exception as exc:
-                err_lower = str(exc).lower()
-                if "429" in err_lower or "resource_exhausted" in err_lower or "quota" in err_lower:
-                    logger.warning(
-                        "Cota Free Tier de embeddings (429) atingida na query; utilizando contingência vetorial local + BM25."
-                    )
-                    query_emb = self._deterministic_test_embedding(search_query, dim=768)
-                else:
-                    raise
+        # Estágio 1.A: Vetorização local da query expandida no ChromaDB (métrica cosine)
+        query_emb = self._embed_texts(
+            [expanded_query],
+            use_mock_embeddings=use_mock_embeddings,
+        )[0]
 
-        n_Query = min(max(top_k * 3, 15), indexed_count)
+        effective_top_n = max(top_n, top_k)
+        n_query = min(max(effective_top_n * 2, 16), indexed_count)
         try:
             chroma_res = self.collection.query(
                 query_embeddings=[query_emb],
-                n_results=n_Query,
+                n_results=n_query,
                 include=["documents", "metadatas", "distances"],
             )
         except Exception as exc:
-            logger.warning(
-                "Diferença de dimensionalidade no ChromaDB (%s); reindexando com contingência consistente (768-d).",
+            logger.info(
+                "Coleção ChromaDB com dimensão antiga detectada na busca (%s); reindexando...",
                 exc,
             )
-            self._using_fallback_embeddings = True
-            query_emb = self._deterministic_test_embedding(search_query, dim=768)
-            chroma_res = None
+            self._recreate_collection()
+            self.index_chunks(use_mock_embeddings=use_mock_embeddings)
+            chroma_res = self.collection.query(
+                query_embeddings=[query_emb],
+                n_results=n_query,
+                include=["documents", "metadatas", "distances"],
+            )
 
         vector_ranks: Dict[str, int] = {}
         vector_scores: Dict[str, float] = {}
@@ -694,23 +615,23 @@ class LGPDRagEngine:
                 chroma_docs[doc_id] = chroma_res["documents"][0][rank_idx - 1]
                 chroma_metas[doc_id] = chroma_res["metadatas"][0][rank_idx - 1]
 
-        # 2. Ranking Lexical com BM25Okapi
+        # Estágio 1.B: Ranking Lexical com BM25Okapi
         bm25_ranks: Dict[str, int] = {}
         bm25_scores_map: Dict[str, float] = {}
         if self.bm25 is not None and self.chunks:
-            query_tokens = tokenize_pt(search_query)
+            query_tokens = tokenize_pt(expanded_query)
             raw_scores = self.bm25.get_scores(query_tokens)
             scored_indices = sorted(
                 enumerate(raw_scores), key=lambda x: x[1], reverse=True
             )
             for rank_idx, (chunk_idx, score_val) in enumerate(
-                scored_indices[: n_Query * 2], start=1
+                scored_indices[: n_query * 2], start=1
             ):
                 c_id = self.chunks[chunk_idx]["id"]
                 bm25_ranks[c_id] = rank_idx
                 bm25_scores_map[c_id] = round(float(score_val), 4)
 
-        # 3. Fusão Reciprocal Rank Fusion (RRF)
+        # Estágio 1.C: Fusão Reciprocal Rank Fusion (RRF) -> Top-N (10 candidatos)
         candidate_ids = set(vector_ranks.keys()) | set(bm25_ranks.keys())
         rrf_results: List[Dict[str, Any]] = []
 
@@ -733,12 +654,18 @@ class LGPDRagEngine:
                 or (chunk_obj["metadata"] if chunk_obj else {})
             )
 
+            # Artigos-âncora identificados pelo expansor jurídico recebem pequeno reforço no Recall
+            artigo_str = str(metadata.get("artigo", "")).strip()
+            if artigo_str and artigo_str in anchor_articles:
+                rrf_score += 0.008
+
             rrf_results.append(
                 {
                     "id": cid,
                     "texto": texto,
                     "metadata": metadata,
                     "rrf_score": round(rrf_score, 6),
+                    "rerank_score": 0.0,
                     "vector_rank": v_rank,
                     "vector_score": vector_scores.get(cid, 0.0),
                     "bm25_rank": b_rank,
@@ -746,6 +673,7 @@ class LGPDRagEngine:
                     "origem": "Busca Híbrida (ChromaDB Cosine + BM25 RRF)",
                     "is_cross_reference": False,
                     "cited_by": None,
+                    "matched_concepts": matched_concepts,
                 }
             )
 
@@ -753,9 +681,18 @@ class LGPDRagEngine:
             key=lambda x: (x["rrf_score"], x["vector_score"], x["bm25_score"]),
             reverse=True,
         )
-        top_chunks = rrf_results[:top_k]
+        candidates_top_n = rrf_results[:effective_top_n]
 
-        # 4. Expansão Automática de Referência Cruzada (até max_cross_refs = 2 artigos complementares)
+        # Estágio 2: Reordenação de Precisão com FlashRank Cross-Encoder (Top-10 -> Top-4)
+        top_chunks = self._rerank_candidates_stage2(
+            original_query=query,
+            expanded_query=expanded_query,
+            candidates=candidates_top_n,
+            top_k=top_k,
+            use_mock_embeddings=use_mock_embeddings,
+        )
+
+        # Etapa 3: Expansão Automática de Referência Cruzada (máx. 1 artigo complementar)
         present_articles = {
             str(item["metadata"].get("artigo", "")).strip()
             for item in top_chunks
@@ -764,74 +701,80 @@ class LGPDRagEngine:
         present_ids = {item["id"] for item in top_chunks}
 
         expanded_chunks: List[Dict[str, Any]] = []
-        for item in top_chunks:
-            if len(expanded_chunks) >= max_cross_refs:
-                break
-            source_artigo = str(item["metadata"].get("artigo", "")).strip() or item[
-                "metadata"
-            ].get("fonte", "Documento")
-            citados_str = str(item["metadata"].get("artigos_citados", "")).strip()
-            if not citados_str:
-                continue
-
-            cited_list = [
-                art.strip() for art in citados_str.split(",") if art.strip()
-            ]
-            for cited_art in cited_list:
+        if max_cross_refs > 0:
+            for item in top_chunks:
                 if len(expanded_chunks) >= max_cross_refs:
                     break
-                if cited_art in present_articles:
+                source_artigo = str(item["metadata"].get("artigo", "")).strip() or item[
+                    "metadata"
+                ].get("fonte", "Documento")
+                citados_str = str(item["metadata"].get("artigos_citados", "")).strip()
+                if not citados_str:
                     continue
 
-                # Busca no ChromaDB por filtro de metadado {"artigo": cited_art}
-                try:
-                    found = self.collection.get(
-                        where={"artigo": cited_art},
-                        include=["documents", "metadatas"],
-                    )
-                    if found and found.get("ids") and len(found["ids"]) > 0:
-                        exp_id = found["ids"][0]
-                        if exp_id not in present_ids:
-                            exp_doc = found["documents"][0]
-                            exp_meta = found["metadatas"][0]
-                            expanded_chunks.append(
-                                {
-                                    "id": exp_id,
-                                    "texto": exp_doc,
-                                    "metadata": exp_meta,
-                                    "rrf_score": 0.0,
-                                    "vector_rank": None,
-                                    "vector_score": 0.0,
-                                    "bm25_rank": None,
-                                    "bm25_score": 0.0,
-                                    "origem": f"Referência Cruzada Automática (citado por {source_artigo})",
-                                    "is_cross_reference": True,
-                                    "cited_by": source_artigo,
-                                }
-                            )
-                            present_articles.add(cited_art)
-                            present_ids.add(exp_id)
-                except Exception as exc:
-                    logger.warning(
-                        "Erro ao expandir referência cruzada para %s: %s",
-                        cited_art,
-                        exc,
-                    )
+                cited_list = [
+                    art.strip() for art in citados_str.split(",") if art.strip()
+                ]
+                for cited_art in cited_list:
+                    if len(expanded_chunks) >= max_cross_refs:
+                        break
+                    if cited_art in present_articles:
+                        continue
+
+                    try:
+                        found = self.collection.get(
+                            where={"artigo": cited_art},
+                            include=["documents", "metadatas"],
+                        )
+                        if found and found.get("ids") and len(found["ids"]) > 0:
+                            exp_id = found["ids"][0]
+                            if exp_id not in present_ids:
+                                exp_doc = found["documents"][0]
+                                exp_meta = found["metadatas"][0]
+                                expanded_chunks.append(
+                                    {
+                                        "id": exp_id,
+                                        "texto": exp_doc,
+                                        "metadata": exp_meta,
+                                        "rrf_score": 0.0,
+                                        "rerank_score": round(
+                                            max(0.50, item.get("rerank_score", 0.70) * 0.85),
+                                            4,
+                                        ),
+                                        "vector_rank": None,
+                                        "vector_score": 0.0,
+                                        "bm25_rank": None,
+                                        "bm25_score": 0.0,
+                                        "origem": f"Referência Cruzada Automática (citado por {source_artigo})",
+                                        "is_cross_reference": True,
+                                        "cited_by": source_artigo,
+                                        "matched_concepts": matched_concepts,
+                                    }
+                                )
+                                present_articles.add(cited_art)
+                                present_ids.add(exp_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Erro ao expandir referência cruzada para %s: %s",
+                            cited_art,
+                            exc,
+                        )
 
         return top_chunks + expanded_chunks
 
     @staticmethod
     def build_normative_context_xml(retrieved_chunks: List[Dict[str, Any]]) -> str:
-        """Formata os chunks recuperados e expandidos dentro da tag <contexto_normativo>."""
+        """Formata os chunks recuperados e reordenados dentro da tag <contexto_normativo>."""
         blocks: List[str] = ["<contexto_normativo>"]
         for idx, item in enumerate(retrieved_chunks, start=1):
             meta = item.get("metadata", {})
             origem = item.get("origem", "Busca Híbrida")
             breadcrumb = meta.get("breadcrumb", "")
             artigos_citados = meta.get("artigos_citados", "")
+            rerank_score = item.get("rerank_score", 0.0)
             blocks.append(
                 f'  <documento indice="{idx}" id="{item["id"]}" '
-                f'origem="{origem}" breadcrumb="{breadcrumb}" '
+                f'score="{rerank_score:.2f}" origem="{origem}" breadcrumb="{breadcrumb}" '
                 f'artigos_citados="{artigos_citados}">\n'
                 f"{item['texto']}\n"
                 f"  </documento>"
@@ -839,79 +782,139 @@ class LGPDRagEngine:
         blocks.append("</contexto_normativo>")
         return "\n".join(blocks)
 
-    def answer_question(
+    def ask_stream(
         self,
         question: str,
-        chat_history: Optional[List[Dict[str, Any]]] = None,
-        model_name: str = "gemini-3.8-flash",
-        top_k: int = 5,
-        max_cross_refs: int = 2,
+        history: Optional[List[Dict[str, Any]]] = None,
+        top_k: int = DEFAULT_TOP_K,
+        max_cross_refs: int = DEFAULT_MAX_CROSS_REFS,
+        provider_name: str = DEFAULT_PROVIDER,
+        model_name: Optional[str] = None,
         api_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        base_url: str = DEFAULT_OLLAMA_URL,
+        provider: Optional[BaseLLMProvider] = None,
+    ) -> StreamAnswerResult:
         """
-        Executa o pipeline RAG completo:
-        1. Reescrita de Query com Histórico (se aplicável)
-        2. Busca Híbrida (ChromaDB + BM25 via RRF) + Expansão Automática de Referências Cruzadas (até 2 artigos)
-        3. Geração da resposta fundamentada no <contexto_normativo> com temperature=0.1
+        Streaming de Ponta a Ponta (Retrieve & Rerank + Geração Visual Interpretativa):
+        1. Executa reescrita condicional (apenas se estritamente necessário, com max_tokens=40)
+        2. Expande sinônimos jurídicos (~0 ms), recupera Top-10 via RRF e reordena Top-4 com FlashRank
+           + até 1 referência cruzada
+        3. Retorna os metadados/fontes recuperadas e o gerador (`Generator[str, None, None]`)
+           para renderização imediata no Streamlit via `st.write_stream`, medindo TTFT.
         """
+        active_provider = provider or LLMProviderFactory.create(
+            provider_name=provider_name,
+            model_name=model_name,
+            api_key=api_key or self.api_key,
+            base_url=base_url,
+            temperature=DEFAULT_TEMPERATURE,
+        )
+
+        t_retrieval_start = time.perf_counter()
         rewritten_query = self.rewrite_query_with_history(
             query=question,
-            chat_history=chat_history,
-            model_name=model_name,
-            api_key=api_key,
+            chat_history=history,
+            provider=active_provider,
         )
-        rewritten_query = expand_colloquial_legal_terms(rewritten_query)
 
         retrieved_chunks = self.hybrid_search_with_cross_ref(
             query=rewritten_query,
             top_k=top_k,
             max_cross_refs=max_cross_refs,
-            api_key=api_key,
         )
+        retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 1)
 
         context_xml = self.build_normative_context_xml(retrieved_chunks)
         user_prompt = (
             f"{context_xml}\n\n"
-            f"Pergunta Original do Usuário: {question}\n"
-            f"Consulta Técnica Utilizada na Busca: {rewritten_query}\n\n"
-            "Elabore a resposta seguindo estritamente as 3 seções obrigatórias "
-            "(1. Resumo Direto, 2. Fundamentação Normativa Exata, 3. Implicação Prática / Checklist de Conformidade) "
+            f"Pergunta do Usuário: {question}\n\n"
+            "Siga rigorosamente o FORMATO VISUAL OBRIGATÓRIO DA RESPOSTA definido nas instruções do sistema "
+            "(### 🎯 Resposta Direta, ### ⚖️ Fundamentação na LGPD / ANPD, ### 📊 Comparativo / Cenários se aplicável, "
+            "### 🛠️ O que fazer na prática e > **⚠️ Ponto de Atenção:**), "
             "baseando-se exclusivamente no <contexto_normativo> acima."
         )
 
-        client = self._get_genai_client(api_key=api_key)
-        gen_config = types.GenerateContentConfig(
-            temperature=0.1,
-            system_instruction=SYSTEM_INSTRUCTION,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        )
-
-        selected_model = DEFAULT_GENERATION_MODEL
-        t0 = time.perf_counter()
-        response, used_model = self._generate_content_resilient(
-            client=client,
-            preferred_model=selected_model,
-            contents=user_prompt,
-            config=gen_config,
-        )
-        latency_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-        answer_text = (response.text or "").strip()
         hybrid_count = sum(1 for c in retrieved_chunks if not c.get("is_cross_reference"))
         cross_ref_count = sum(1 for c in retrieved_chunks if c.get("is_cross_reference"))
 
-        return {
-            "question": question,
-            "rewritten_query": rewritten_query,
-            "answer": answer_text,
-            "model_requested": selected_model,
-            "model_used": used_model,
-            "temperature": 0.1,
-            "latency_ms": latency_ms,
-            "hybrid_count": hybrid_count,
-            "cross_ref_count": cross_ref_count,
-            "system_instruction": SYSTEM_INSTRUCTION,
-            "user_prompt": user_prompt,
-            "retrieved_chunks": retrieved_chunks,
-            "context_xml": context_xml,
-        }
+        result = StreamAnswerResult(
+            {
+                "question": question,
+                "rewritten_query": self.last_expanded_query or rewritten_query,
+                "matched_concepts": list(self.last_matched_concepts),
+                "answer": "",
+                "provider": active_provider.provider_key,
+                "model_requested": active_provider.model_name,
+                "model_used": active_provider.model_name,
+                "temperature": active_provider.temperature,
+                "retrieval_ms": retrieval_ms,
+                "ttft_ms": 0.0,
+                "ttft_s": 0.0,
+                "latency_ms": retrieval_ms,
+                "hybrid_count": hybrid_count,
+                "cross_ref_count": cross_ref_count,
+                "system_instruction": SYSTEM_PROMPT,
+                "user_prompt": user_prompt,
+                "retrieved_chunks": retrieved_chunks,
+                "context_xml": context_xml,
+            }
+        )
+
+        def _token_stream() -> Generator[str, None, None]:
+            t_gen_start = time.perf_counter()
+            first_token_received = False
+            collected: List[str] = []
+            for token_chunk in active_provider.stream_generate(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+            ):
+                if not first_token_received and token_chunk:
+                    first_token_received = True
+                    ttft_val = round((time.perf_counter() - t_gen_start) * 1000, 1)
+                    result["ttft_ms"] = ttft_val
+                    result["ttft_s"] = round(ttft_val / 1000.0, 2)
+                collected.append(token_chunk)
+                yield token_chunk
+
+            gen_ms = round((time.perf_counter() - t_gen_start) * 1000, 1)
+            if not first_token_received:
+                result["ttft_ms"] = gen_ms
+                result["ttft_s"] = round(gen_ms / 1000.0, 2)
+            result["answer"] = "".join(collected).strip()
+            result["model_used"] = active_provider.model_name
+            result["latency_ms"] = round(retrieval_ms + gen_ms, 1)
+
+        result["stream"] = _token_stream()
+        return result
+
+    def answer_question(
+        self,
+        question: str,
+        chat_history: Optional[List[Dict[str, Any]]] = None,
+        model_name: Optional[str] = None,
+        top_k: int = DEFAULT_TOP_K,
+        max_cross_refs: int = DEFAULT_MAX_CROSS_REFS,
+        api_key: Optional[str] = None,
+        provider_name: str = DEFAULT_PROVIDER,
+        base_url: str = DEFAULT_OLLAMA_URL,
+        provider: Optional[BaseLLMProvider] = None,
+    ) -> Dict[str, Any]:
+        """Versão síncrona que consome `ask_stream` e retorna o dicionário completo com a resposta final."""
+        effective_provider = provider_name
+        if api_key and provider_name == DEFAULT_PROVIDER and model_name and "gemini" in model_name.lower():
+            effective_provider = "gemini"
+
+        res = self.ask_stream(
+            question=question,
+            history=chat_history,
+            top_k=top_k,
+            max_cross_refs=max_cross_refs,
+            provider_name=effective_provider,
+            model_name=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            provider=provider,
+        )
+        for _ in res["stream"]:
+            pass
+        return dict(res)

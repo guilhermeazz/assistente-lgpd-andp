@@ -6,8 +6,10 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
-# Banco vetorial local gerado em runtime (recriado na indexação)
+# Banco vetorial local e cache de pesos de embedding/reranker gerados em runtime
 data/processed/chroma_db/
+data/models_cache/
+.cache/
 
 # Arquivos de sistema e variáveis de ambiente locais
 .env

@@ -1,22 +1,24 @@
 """
-Interface Conversacional Auditável e Documentação Arquitetural (src/app.py)
-Design inspirado no conceito Dark Obsidian & Teal Glassmorphism (estilo LIX AI):
-- Orbe 3D iridescente centralizado, tipografia em dois níveis ("Olá, ..." / "Como posso ajudar hoje?")
-- Container central estilo "Pro" com barra de status do pipeline e pílulas de ferramentas
-- 3 cards minimalistas de ação rápida em vidro fumê + sugestões minimizadas
-- Chat estruturado com inspeção completa de Requisição, Resposta e Grounding (RRF + Cross-Reference)
-- Página dedicada ao detalhamento arquitetural e engenharia do projeto
+Interface Conversacional Auditável Multi-Provedor e Documentação Arquitetural (src/app.py)
+Implementa:
+- Cache em Memória (@st.cache_resource) para SentenceTransformer local, ChromaDB e BM25
+- Seletor Multi-Provedor na Sidebar:
+  1. Qwen (Local - Ollama) [Padrão] — 100% offline/local com diagnóstico `check_ollama_status()`
+  2. Google Gemini (API Key - BYOK)
+  3. OpenAI / ChatGPT (API Key - BYOK)
+  4. Anthropic / Claude (API Key - BYOK)
+- Renderização de respostas em tempo real via `st.write_stream`
+- Telemetria discreta abaixo de cada resposta: Latência de Recuperação (ms) e TTFT (Tempo até o 1º Token)
+- Design Dark Obsidian & Teal Glassmorphism com ondas SVG responsivas e barra de digitação fixa
 """
 
 from __future__ import annotations
 
-import importlib
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-# Garante que a raiz do projeto e o site-packages do .venv estejam no sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -30,18 +32,27 @@ from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from src.ingestion.fetcher import DEFAULT_RAW_DIR, run_ingestion_fetcher
 from src.ingestion.parser import DEFAULT_OUTPUT_JSONL, run_parser_pipeline
-import src.rag.engine as _engine_mod
-
-if not hasattr(_engine_mod.LGPDRagEngine, "_discover_available_models") or not hasattr(
-    _engine_mod.LGPDRagEngine, "_embedding_cache"
-):
-    importlib.reload(_engine_mod)
-
 from src.rag.engine import (
-    DEFAULT_GENERATION_MODEL,
-    EMBEDDING_MODEL,
+    DEFAULT_MAX_CROSS_REFS,
+    DEFAULT_TOP_K,
+    FLASHRANK_CACHE_DIR,
+    FLASHRANK_MODEL,
+    LOCAL_EMBEDDING_MODEL,
     LGPDRagEngine,
-    SYSTEM_INSTRUCTION,
+    get_local_embedder,
+    get_local_reranker,
+)
+from src.rag.prompts import SYSTEM_PROMPT
+from src.rag.providers import (
+    ANTHROPIC_MODELS,
+    DEFAULT_OLLAMA_URL,
+    GEMINI_MODELS,
+    OLLAMA_MODELS,
+    OPENAI_MODELS,
+    PROVIDER_DEFAULT_MODELS,
+    PROVIDER_LABELS,
+    check_ollama_status,
+    normalize_provider_key,
 )
 
 FEATURED_CARDS: List[Dict[str, str]] = [
@@ -73,12 +84,43 @@ EXTRA_SUGGESTIONS: List[str] = [
 ]
 
 
+@st.cache_resource(show_spinner=False)
+def get_cached_embedder() -> Any:
+    """Cacheia o modelo SentenceTransformer local em memória para toda a sessão do servidor."""
+    return get_local_embedder(LOCAL_EMBEDDING_MODEL)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_reranker() -> Any:
+    """Cacheia o objeto Ranker do FlashRank (`ms-marco-MultiBERT-L-12`) para manter o reranking < 100ms."""
+    return get_local_reranker(
+        model_name=FLASHRANK_MODEL,
+        cache_dir=FLASHRANK_CACHE_DIR,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_rag_engine() -> LGPDRagEngine:
+    """
+    Cacheia a instância do LGPDRagEngine (incluindo cliente ChromaDB, SentenceTransformer local,
+    FlashRank Cross-Encoder e índice lexical BM25) para evitar recarregamento de disco a cada pergunta.
+    """
+    embedder = get_cached_embedder()
+    reranker = get_cached_reranker()
+    engine = LGPDRagEngine(embedder=embedder, reranker=reranker)
+    if engine.chunks and engine.get_indexed_count() != len(engine.chunks):
+        try:
+            engine.index_chunks()
+        except Exception:
+            pass
+    return engine
+
+
 def _inject_lix_inspired_css() -> None:
-    """Injeta o tema visual Dark Obsidian com brilho radial azul-petróleo e Orbe 3D iridescente."""
+    """Injeta o tema visual Dark Obsidian & Teal Glassmorphism com ondas responsivas e métricas discretas."""
     st.markdown(
         """
         <style>
-        /* Fundo principal Dark Obsidian com brilho radial Teal na base (inspirado na referência LIX) */
         .stApp {
             background:
                 radial-gradient(ellipse 75% 42% at 50% 102%, rgba(14, 165, 233, 0.22) 0%, rgba(13, 148, 136, 0.10) 38%, rgba(9, 13, 20, 0.0) 75%),
@@ -86,7 +128,6 @@ def _inject_lix_inspired_css() -> None:
             color: #f8fafc !important;
         }
 
-        /* Barra lateral minimalista escura */
         section[data-testid="stSidebar"] {
             background: #06090f !important;
             border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
@@ -98,7 +139,6 @@ def _inject_lix_inspired_css() -> None:
             max-width: 920px !important;
         }
 
-        /* Marca estilo LIX no topo */
         .brand-logo {
             font-size: 1.15rem;
             font-weight: 800;
@@ -118,7 +158,6 @@ def _inject_lix_inspired_css() -> None:
             display: inline-block;
         }
 
-        /* Efeito de Linhas em Ondas Fluidas Responsivas e Sem Fundo */
         .wave-hero-container {
             position: relative;
             width: 100%;
@@ -159,7 +198,6 @@ def _inject_lix_inspired_css() -> None:
             100% { transform: translateY(-4px) scaleY(0.92); opacity: 0.95; }
         }
 
-        /* Saudação Centralizada com Degradê */
         .lix-greeting-wrap {
             text-align: center;
             margin-bottom: 1.55rem;
@@ -185,12 +223,11 @@ def _inject_lix_inspired_css() -> None:
         .lix-subtext {
             font-size: 0.90rem;
             color: #64748b;
-            max-width: 520px;
+            max-width: 560px;
             margin: 0 auto;
             line-height: 1.45;
         }
 
-        /* Container Central Glassmorphic ("Unlock more features with Pro" style) */
         .pro-shell {
             width: 100%;
             box-sizing: border-box;
@@ -202,7 +239,6 @@ def _inject_lix_inspired_css() -> None:
             margin-bottom: 0.75rem;
         }
 
-        /* Barra de digitação fixa no rodapé com a mesma largura (920px) dos blocos centralizados */
         div[data-testid="stBottom"] {
             background: linear-gradient(180deg, rgba(9, 13, 20, 0.0) 0%, rgba(9, 13, 20, 0.92) 38%, #090d14 100%) !important;
         }
@@ -274,7 +310,25 @@ def _inject_lix_inspired_css() -> None:
             gap: 0.32rem;
         }
 
-        /* 3 Cards Minimalistas de Sugestão na Base */
+        .latency-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.65rem;
+            font-size: 0.75rem;
+            color: #94a3b8;
+            background: rgba(11, 17, 27, 0.72);
+            border: 1px solid rgba(56, 189, 248, 0.16);
+            border-radius: 10px;
+            padding: 0.38rem 0.75rem;
+            margin-top: 0.45rem;
+            margin-bottom: 0.45rem;
+        }
+        .latency-badge {
+            color: #38bdf8;
+            font-weight: 600;
+        }
+
         .feature-card {
             background: rgba(15, 25, 38, 0.52);
             border: 1px solid rgba(56, 189, 248, 0.12);
@@ -302,7 +356,6 @@ def _inject_lix_inspired_css() -> None:
             line-height: 1.38;
         }
 
-        /* Botões estilizados em vidro escuro */
         .stButton > button {
             border-radius: 11px !important;
             border: 1px solid rgba(56, 189, 248, 0.18) !important;
@@ -324,7 +377,6 @@ def _inject_lix_inspired_css() -> None:
             font-weight: 600 !important;
         }
 
-        /* Mensagens do Chat e Expanders */
         div[data-testid="stChatMessage"] {
             background: rgba(15, 23, 36, 0.58) !important;
             border: 1px solid rgba(255, 255, 255, 0.07) !important;
@@ -338,7 +390,6 @@ def _inject_lix_inspired_css() -> None:
             border-radius: 12px !important;
         }
 
-        /* Cards da página de Arquitetura */
         .arch-card {
             background: rgba(15, 25, 38, 0.58);
             border: 1px solid rgba(56, 189, 248, 0.16);
@@ -363,58 +414,120 @@ def _inject_lix_inspired_css() -> None:
 
 
 def _init_session_state() -> None:
-    """Inicializa variáveis obrigatórias em st.session_state (incluindo BYOK)."""
+    """Inicializa variáveis de sessão para arquitetura Multi-Provedor (Local + BYOK)."""
+    if "provider_key" not in st.session_state:
+        st.session_state["provider_key"] = "ollama"
+    if "selected_model" not in st.session_state:
+        st.session_state["selected_model"] = PROVIDER_DEFAULT_MODELS["ollama"]
+    if "ollama_base_url" not in st.session_state:
+        st.session_state["ollama_base_url"] = DEFAULT_OLLAMA_URL
+    if "custom_ollama_tag" not in st.session_state:
+        st.session_state["custom_ollama_tag"] = ""
+    if "api_keys" not in st.session_state:
+        st.session_state["api_keys"] = {
+            "gemini": "",
+            "openai": "",
+            "anthropic": "",
+        }
     if "gemini_api_key" not in st.session_state:
         st.session_state["gemini_api_key"] = ""
-    if "selected_model" not in st.session_state:
-        st.session_state["selected_model"] = DEFAULT_GENERATION_MODEL
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
     if "pending_suggestion" not in st.session_state:
         st.session_state["pending_suggestion"] = None
-    if (
-        "rag_engine" not in st.session_state
-        or not hasattr(st.session_state["rag_engine"], "_embedding_cache")
-    ):
-        st.session_state["rag_engine"] = LGPDRagEngine(
-            api_key=st.session_state["gemini_api_key"]
-        )
 
 
-def _render_grounding_expander(retrieved_chunks: List[Dict[str, Any]]) -> None:
-    """Renderiza o expander auditável com as fontes recuperadas e referências cruzadas."""
+def _render_latency_telemetry_bar(trace: Dict[str, Any]) -> None:
+    """Exibe resumo de latência detalhado abaixo da resposta: Busca + Rerank (ms) e TTFT (s)."""
+    if not trace:
+        return
+    retrieval_ms = trace.get("retrieval_ms", 0.0)
+    ttft_ms = trace.get("ttft_ms", 0.0)
+    ttft_s = trace.get("ttft_s", round(float(ttft_ms) / 1000.0, 2))
+    provider = trace.get("provider", "ollama").upper()
+    model_used = trace.get("model_used", "")
+    hybrid_cnt = trace.get("hybrid_count", 0)
+    cross_cnt = trace.get("cross_ref_count", 0)
+
+    st.markdown(
+        f"""
+        <div class="latency-bar">
+            <span>⚡ Busca + Rerank: <span class="latency-badge">{retrieval_ms} ms</span></span>
+            <span>|</span>
+            <span>⏱️ Primeiro Token (TTFT): <span class="latency-badge">{ttft_s:.2f} s</span> ({ttft_ms} ms)</span>
+            <span>|</span>
+            <span>🤖 <code>{provider} / {model_used}</code> ({hybrid_cnt} Reranked + {cross_cnt} Cross-Ref)</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_grounding_expander(
+    retrieved_chunks: List[Dict[str, Any]],
+    trace: Dict[str, Any] | None = None,
+) -> None:
+    """
+    Renderiza o expander auditável '🔍 Fontes Oficiais Recuperadas e Auditoria (Grounding)' com:
+    1. Conceitos jurídicos expandidos automaticamente (se ativados no dicionário).
+    2. Nota de relevância do Reranker (Score: 0.XX) ao lado da referência normativa e texto exato.
+    3. Resumo de latência detalhado: Busca + Rerank: X ms | Primeiro Token (TTFT): Y s.
+    """
     with st.expander(
-        "🔍 Fontes Oficiais Recuperadas e Referências Cruzadas (Grounding)",
+        "🔍 Fontes Oficiais Recuperadas e Auditoria (Grounding)",
         expanded=False,
     ):
+        trace_data = trace or {}
+        retrieval_ms = trace_data.get("retrieval_ms", 0.0)
+        ttft_ms = trace_data.get("ttft_ms", 0.0)
+        ttft_s = trace_data.get("ttft_s", round(float(ttft_ms) / 1000.0, 2))
+
+        st.caption(
+            f"⏱️ **Telemetria do Pipeline:** `Busca + Rerank: {retrieval_ms} ms | Primeiro Token (TTFT): {ttft_s:.2f} s`"
+        )
+
+        # 1. Conceitos jurídicos expandidos automaticamente
+        matched_concepts = trace_data.get("matched_concepts") or (
+            retrieved_chunks[0].get("matched_concepts", []) if retrieved_chunks else []
+        )
+        if matched_concepts:
+            st.markdown("##### 🧠 Conceitos Jurídicos Expandidos Automaticamente (`~0 ms`)")
+            for concept in matched_concepts:
+                st.markdown(f"- 🔹 `{concept}`")
+            st.divider()
+
         if not retrieved_chunks:
             st.info("Nenhum chunk normativo associado a esta resposta.")
             return
 
+        # 2. Chunks recuperados com Score do Reranker (Score: 0.XX)
         for idx, chunk in enumerate(retrieved_chunks, start=1):
             meta = chunk.get("metadata", {})
             origem = chunk.get("origem", "Busca Híbrida")
             is_cross = chunk.get("is_cross_reference", False)
+            rerank_score = float(chunk.get("rerank_score", 0.0))
             badge = (
                 "🔗 **[EXPANSÃO DE REFERÊNCIA CRUZADA]**"
                 if is_cross
-                else "🎯 **[BUSCA HÍBRIDA RRF]**"
+                else "🎯 **[TOP-4 RERANKER / RRF]**"
             )
 
             st.markdown(
-                f"##### #{idx} {badge} `{meta.get('breadcrumb', chunk.get('id'))}`"
+                f"##### #{idx} {badge} `{meta.get('breadcrumb', chunk.get('id'))}` — **Score: `{rerank_score:.2f}`**"
             )
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.caption(f"🧭 **Origem:** {origem}")
             with col2:
                 if is_cross:
-                    st.caption(f"↪️ **Citado por:** `{chunk.get('cited_by', '-')}`")
+                    st.caption(
+                        f"↪️ **Citado por:** `{chunk.get('cited_by', '-')}` | **Score:** `{rerank_score:.2f}`"
+                    )
                 else:
                     st.caption(
-                        f"📊 **RRF:** `{chunk.get('rrf_score', 0.0):.5f}` | "
-                        f"**Cosine:** `{chunk.get('vector_score', 0.0):.4f}` | "
-                        f"**BM25:** `{chunk.get('bm25_score', 0.0):.2f}`"
+                        f"🏅 **Rerank Score:** `{rerank_score:.2f}` | "
+                        f"**RRF:** `{chunk.get('rrf_score', 0.0):.5f}` | "
+                        f"**Cosine:** `{chunk.get('vector_score', 0.0):.4f}`"
                     )
             with col3:
                 citados = meta.get("artigos_citados") or "Nenhuma"
@@ -439,8 +552,8 @@ def _render_request_response_inspector(msg: Dict[str, Any]) -> None:
         tab_req, tab_resp, tab_sys = st.tabs(
             [
                 "📤 Contexto da Requisição (Prompt + XML)",
-                "📥 Resposta & Telemetria",
-                "⚙️ System Instruction & Parâmetros",
+                "📥 Telemetria & Latência",
+                "⚙️ System Prompt & Reranker",
             ]
         )
 
@@ -450,25 +563,25 @@ def _render_request_response_inspector(msg: Dict[str, Any]) -> None:
                 f"**💬 Pergunta do Usuário:**\n> {trace.get('question', '-')}"
             )
             c2.markdown(
-                f"**🔎 Query Técnica Executada na Busca Híbrida:**\n> `{trace.get('rewritten_query', '-')}`"
+                f"**🔎 Query Expandida (Expansor Jurídico):**\n> `{trace.get('rewritten_query', '-')}`"
             )
             st.markdown("**📦 Tag `<contexto_normativo>` Enviada ao Modelo:**")
             st.code(trace.get("context_xml", ""), language="xml")
-            st.markdown("**📝 Prompt Completo de Entrada (`contents`):**")
+            st.markdown("**📝 Prompt Completo de Entrada:**")
             st.code(trace.get("user_prompt", ""), language="markdown")
 
         with tab_resp:
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric(
-                "✨ Modelo Configurado",
-                trace.get("model_requested", DEFAULT_GENERATION_MODEL),
-            )
-            m2.metric("🎯 Chunks Híbridos (RRF)", trace.get("hybrid_count", 0))
-            m3.metric("🔗 Cross-References", trace.get("cross_ref_count", 0))
-            m4.metric("⏱️ Latência Geração", f"{trace.get('latency_ms', 0)} ms")
+            m1.metric("🤖 Modelo", trace.get("model_used", "-"))
+            m2.metric("⚡ Busca + Rerank", f"{trace.get('retrieval_ms', 0)} ms")
+            ttft_s = trace.get("ttft_s", round(float(trace.get("ttft_ms", 0.0)) / 1000.0, 2))
+            m3.metric("⏱️ Primeiro Token (TTFT)", f"{ttft_s:.2f} s")
+            m4.metric("🏁 Tempo Total", f"{trace.get('latency_ms', 0)} ms")
 
             st.caption(
-                f"Cluster efetivo utilizado na API: `{trace.get('model_used', DEFAULT_GENERATION_MODEL)}` | "
+                f"Provedor: `{trace.get('provider', 'ollama')}` | "
+                f"Chunks Reranked (Top-K={DEFAULT_TOP_K}): `{trace.get('hybrid_count', 0)}` | "
+                f"Cross-Reference (Máx={DEFAULT_MAX_CROSS_REFS}): `{trace.get('cross_ref_count', 0)}` | "
                 f"Temperatura: `{trace.get('temperature', 0.1)}`"
             )
             st.markdown("**📄 Resposta Bruta Retornada (Markdown):**")
@@ -476,23 +589,43 @@ def _render_request_response_inspector(msg: Dict[str, Any]) -> None:
 
         with tab_sys:
             st.markdown(
-                f"- **SDK Oficial:** `google-genai` (`genai.Client`)\n"
-                f"- **Modelo de Geração:** `{DEFAULT_GENERATION_MODEL}` (`temperature=0.1`)\n"
-                f"- **Modelo de Embeddings:** `{EMBEDDING_MODEL}` (`RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`)\n"
-                f"- **Métrica Vetorial ChromaDB:** `cosine` + **Lexical:** `BM25Okapi` (Fusão `RRF k=60`)"
+                f"- **Provedor Ativo:** `{trace.get('provider', 'ollama')}` (`{trace.get('model_used', '-')}`)\n"
+                f"- **Embeddings 100% Locais:** `{LOCAL_EMBEDDING_MODEL}` (384-d Cosine)\n"
+                f"- **Reranker Cross-Encoder Local:** `FlashRank ({FLASHRANK_MODEL})`\n"
+                f"- **Busca em 2 Estágios:** `Top-10 RRF (Chroma + BM25)` $\\rightarrow$ `Top-{DEFAULT_TOP_K} FlashRank` + `{DEFAULT_MAX_CROSS_REFS} Cross-Ref`"
             )
-            st.markdown("**📜 System Instruction Estruturado:**")
+            st.markdown("**📜 System Prompt Visual & Interpretativo (`src/rag/prompts.py`):**")
             st.code(
-                trace.get("system_instruction", SYSTEM_INSTRUCTION), language="markdown"
+                trace.get("system_instruction", SYSTEM_PROMPT), language="markdown"
             )
 
 
 def _render_chat_page(engine: LGPDRagEngine) -> None:
-    """Renderiza a página principal de Chat com linhas em ondas em degradê e saudação centralizada."""
+    """Renderiza a página principal de Chat com streaming nativo e telemetria TTFT."""
     indexed_count = engine.get_indexed_count()
     jsonl_count = len(engine.chunks)
+    provider_key = st.session_state["provider_key"]
+    active_model = st.session_state["selected_model"]
+    active_api_key = st.session_state["api_keys"].get(provider_key, "")
 
-    # 1. Efeito Visual de Linhas em Ondas em Degradê + Saudação Centralizada
+    if provider_key == "ollama":
+        ollama_info = check_ollama_status(
+            base_url=st.session_state["ollama_base_url"],
+            model_name=active_model,
+        )
+        if ollama_info["online"] and ollama_info["model_ready"]:
+            status_badge = f"🟢 Ollama Local Online ({active_model})"
+        elif ollama_info["online"]:
+            status_badge = f"🟡 Ollama Ativo (falta pull {active_model})"
+        else:
+            status_badge = "🟠 Ollama Local Offline"
+    else:
+        status_badge = (
+            f"🟢 API Key ({provider_key.upper()})"
+            if active_api_key
+            else f"🟠 Aguardando API Key ({provider_key.upper()})"
+        )
+
     st.markdown(
         """
         <div class="wave-hero-container">
@@ -527,37 +660,34 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
             <div class="lix-hi">Assistente Inteligente LGPD & ANPD</div>
             <div class="lix-headline">Como posso ajudar hoje?</div>
             <div class="lix-subtext">
-                Estou aqui para apoiar sua conformidade — de consultas rápidas de artigos da LGPD
-                a pareceres completos com resoluções da ANPD e referências cruzadas.
+                Arquitetura RAG Híbrida de Baixa Latência — Embeddings 100% locais com SentenceTransformers
+                e inferência em Streaming via Qwen Local (Ollama), Gemini, ChatGPT ou Claude.
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # 2. Container Central Estilo "Pro" com Pílulas de Identificação do Processo
-    auth_badge = "🟢 API Key Conectada" if st.session_state["gemini_api_key"] else "🟠 Aguardando API Key"
     st.markdown(
         f"""
         <div class="pro-shell">
             <div class="pro-header-bar">
                 <div class="pro-header-left">
                     <span class="pro-spark">⚡</span>
-                    <span>Motor RAG Híbrido Ativo com <strong>Gemini 3.8 Flash</strong></span>
+                    <span>Motor RAG Multi-Provedor Ativo com <strong>{active_model}</strong></span>
                 </div>
-                <span style="font-size: 0.74rem; color: #38bdf8;">{auth_badge} • {indexed_count}/{jsonl_count} Chunks</span>
+                <span style="font-size: 0.74rem; color: #38bdf8;">{status_badge} • {indexed_count}/{jsonl_count} Chunks</span>
             </div>
             <div class="pro-inner-box">
                 <div style="font-size: 0.83rem; color: #94a3b8; margin-bottom: 0.45rem;">
-                    Pipeline de Conformidade Normativa (Auditoria & Grounding Estrito):
+                    Pipeline de Baixa Latência (Embeddings Locais + Streaming Token-a-Token):
                 </div>
                 <div class="tool-pills-row">
-                    <span class="tool-pill">🔐 BYOK Sessão</span>
-                    <span class="tool-pill">🌐 SHA-256 Planalto & ANPD</span>
-                    <span class="tool-pill">🧩 Chunking Semântico</span>
+                    <span class="tool-pill">🧠 MiniLM-L12-v2 Local</span>
                     <span class="tool-pill">⚖️ Chroma Cosine + BM25 RRF</span>
-                    <span class="tool-pill">🔗 Cross-Reference (Artigos)</span>
-                    <span class="tool-pill">✨ {DEFAULT_GENERATION_MODEL}</span>
+                    <span class="tool-pill">📦 Context Budget (Top-4 + 1 Cross-Ref)</span>
+                    <span class="tool-pill">⚡ Streaming Nativo (TTFT)</span>
+                    <span class="tool-pill">🤖 {PROVIDER_LABELS[provider_key]}</span>
                 </div>
             </div>
         </div>
@@ -565,7 +695,6 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
         unsafe_allow_html=True,
     )
 
-    # 3. Três Cards Minimalistas de Ação Rápida (mesma largura da estrutura central)
     cols = st.columns(3)
     for idx, card in enumerate(FEATURED_CARDS):
         with cols[idx]:
@@ -585,7 +714,6 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
             ):
                 st.session_state["pending_suggestion"] = card["prompt"]
 
-    # 4. Mais Sugestões Minimizadas
     with st.expander("💡 Mais Sugestões de Consulta (minimizadas)", expanded=False):
         s_cols = st.columns(2)
         for idx, sug in enumerate(EXTRA_SUGGESTIONS):
@@ -597,18 +725,21 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
     if st.session_state["messages"]:
         st.divider()
 
-    # 5. Estrutura de Conversa (Pergunta do Usuário -> Resposta do Chatbot + Contexto Completo)
     for msg in st.session_state["messages"]:
         avatar = "🧑‍💼" if msg["role"] == "user" else "🛡️"
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
             if msg["role"] == "assistant":
+                if msg.get("trace") is not None:
+                    _render_latency_telemetry_bar(msg["trace"])
                 if msg.get("retrieved_chunks") is not None:
-                    _render_grounding_expander(msg["retrieved_chunks"])
+                    _render_grounding_expander(
+                        msg["retrieved_chunks"],
+                        trace=msg.get("trace"),
+                    )
                 if msg.get("trace") is not None:
                     _render_request_response_inspector(msg)
 
-    # 6. Barra de Digitação Fixa na Parte Inferior (com max-width 920px alinhada aos blocos)
     user_input = st.chat_input(
         "Pergunte qualquer coisa sobre a LGPD ou Resoluções da ANPD..."
     )
@@ -620,83 +751,75 @@ def _render_chat_page(engine: LGPDRagEngine) -> None:
         with st.chat_message("user", avatar="🧑‍💼"):
             st.markdown(active_question)
 
-        if not st.session_state["gemini_api_key"]:
+        if provider_key != "ollama" and not active_api_key:
             with st.chat_message("assistant", avatar="🛡️"):
                 st.warning(
-                    "🔑 **Autenticação Necessária:** Insira sua **Gemini API Key** na barra lateral esquerda para autenticar a sessão (BYOK)."
+                    f"🔑 **Autenticação BYOK Necessária:** Insira sua API Key para **{PROVIDER_LABELS[provider_key]}** na barra lateral esquerda, "
+                    "ou selecione **Qwen (Local - Ollama) [Padrão]** para rodar 100% localmente sem chave."
                 )
             return
 
-        if engine.get_indexed_count() == 0:
-            with st.chat_message("assistant", avatar="🛡️"):
-                st.warning(
-                    "🗄️ **Base Vetorial Ainda Não Indexada:** Clique em **'🔄 Sincronizar e Indexar Base Oficial'** na barra lateral esquerda."
-                )
-            return
+        if provider_key == "ollama":
+            st_check = check_ollama_status(
+                base_url=st.session_state["ollama_base_url"],
+                model_name=active_model,
+            )
+            if not st_check["online"]:
+                with st.chat_message("assistant", avatar="🛡️"):
+                    st.warning(f"⚠️ **Ollama Local Offline:** {st_check['message']}")
+                return
+            if not st_check["model_ready"]:
+                with st.chat_message("assistant", avatar="🛡️"):
+                    st.warning(f"📥 **Modelo Qwen Ausente no Ollama:** {st_check['message']}")
+                return
 
         with st.chat_message("assistant", avatar="🛡️"):
-            with st.status(
-                "⚡ Executando Pipeline RAG Híbrido & Cross-Reference...",
-                expanded=True,
-            ) as proc_status:
-                try:
-                    prior_history = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state["messages"]
-                    ]
-                    st.write(
-                        "🔎 **Etapa 1/3:** Analisando contexto conversacional e preparando query técnica..."
-                    )
-                    st.write(
-                        "⚖️ **Etapa 2/3:** Buscando no `ChromaDB (Cosine)` + `BM25 (RRF)` e expandindo `artigos_citados`..."
-                    )
-                    st.write(
-                        f"✨ **Etapa 3/3:** Gerando parecer fundamentado com `{DEFAULT_GENERATION_MODEL}` (`temperature=0.1`)..."
-                    )
+            try:
+                prior_history = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state["messages"]
+                ]
 
-                    result = engine.answer_question(
-                        question=active_question,
-                        chat_history=prior_history,
-                        model_name=DEFAULT_GENERATION_MODEL,
-                        top_k=5,
-                        max_cross_refs=2,
-                        api_key=st.session_state["gemini_api_key"],
-                    )
+                stream_result = engine.ask_stream(
+                    question=active_question,
+                    history=prior_history,
+                    top_k=DEFAULT_TOP_K,
+                    max_cross_refs=DEFAULT_MAX_CROSS_REFS,
+                    provider_name=provider_key,
+                    model_name=active_model,
+                    api_key=active_api_key,
+                    base_url=st.session_state["ollama_base_url"],
+                )
 
-                    proc_status.update(
-                        label=(
-                            f"✅ Parecer Concluído ({result.get('hybrid_count', 0)} chunks híbridos + "
-                            f"{result.get('cross_ref_count', 0)} referências cruzadas • {result.get('latency_ms', 0)} ms)"
-                        ),
-                        state="complete",
-                        expanded=False,
-                    )
+                answer_md = st.write_stream(stream_result["stream"])
+                if not isinstance(answer_md, str):
+                    answer_md = stream_result.get("answer", "")
 
-                    answer_md = result["answer"]
-                    retrieved = result["retrieved_chunks"]
+                trace_dict = dict(stream_result)
+                trace_dict.pop("stream", None)
+                trace_dict["answer"] = answer_md
 
-                    st.markdown(answer_md)
-                    _render_grounding_expander(retrieved)
+                _render_latency_telemetry_bar(trace_dict)
+                _render_grounding_expander(
+                    trace_dict["retrieved_chunks"],
+                    trace=trace_dict,
+                )
 
-                    msg_record = {
-                        "role": "assistant",
-                        "content": answer_md,
-                        "retrieved_chunks": retrieved,
-                        "trace": result,
-                    }
-                    _render_request_response_inspector(msg_record)
+                msg_record = {
+                    "role": "assistant",
+                    "content": answer_md,
+                    "retrieved_chunks": trace_dict["retrieved_chunks"],
+                    "trace": trace_dict,
+                }
+                _render_request_response_inspector(msg_record)
 
-                    st.session_state["messages"].append(
-                        {"role": "user", "content": active_question}
-                    )
-                    st.session_state["messages"].append(msg_record)
+                st.session_state["messages"].append(
+                    {"role": "user", "content": active_question}
+                )
+                st.session_state["messages"].append(msg_record)
 
-                except Exception as exc:
-                    proc_status.update(
-                        label="❌ Falha durante o processamento da consulta",
-                        state="error",
-                    )
-                    st.error(f"Não foi possível concluir a consulta: {exc}")
+            except Exception as exc:
+                st.error(f"Não foi possível concluir a consulta: {exc}")
 
 
 def _render_project_details_page(engine: LGPDRagEngine) -> None:
@@ -704,10 +827,11 @@ def _render_project_details_page(engine: LGPDRagEngine) -> None:
     st.markdown(
         """
         <div class="lix-greeting-wrap" style="margin-bottom: 1.2rem;">
-            <div class="lix-hi">Engenharia de Dados & IA Generativa</div>
+            <div class="lix-hi">Engenharia de Dados & IA Generativa de Baixa Latência</div>
             <div class="lix-headline">Arquitetura & Construção do Projeto</div>
             <div class="lix-subtext">
-                Conheça em detalhes como cada módulo do Assistente Inteligente de Conformidade LGPD & ANPD foi projetado e validado.
+                Conheça como o motor RAG Híbrido Multi-Provedor combina Embeddings Locais (SentenceTransformers)
+                e Streaming Token-a-Token via Qwen (Ollama), Gemini, OpenAI e Claude.
             </div>
         </div>
         """,
@@ -739,18 +863,18 @@ def _render_project_details_page(engine: LGPDRagEngine) -> None:
         st.markdown(
             """
             <div class="arch-card">
-                <h4>🌐 1. Coleta Resiliente (<code>src/ingestion/fetcher.py</code>)</h4>
+                <h4>🧠 1. Embeddings 100% Locais (<code>SentenceTransformers</code>)</h4>
                 <ul>
-                    <li><strong>Conversão de Encoding:</strong> Coleta a LGPD Compilada do Planalto em <code>iso-8859-1</code> e converte para <code>UTF-8</code>.</li>
-                    <li><strong>Integridade SHA-256:</strong> Gera manifesto de hashes criptográficos e só reescreve arquivos caso o conteúdo oficial mude.</li>
-                    <li><strong>Fallback Local Obrigatório:</strong> Tolerante a bloqueios de WAF/SSL do <code>gov.br</code>, operando com contingência local automática em <code>data/raw/</code>.</li>
+                    <li><strong>Desacoplamento Completo:</strong> Usa <code>paraphrase-multilingual-MiniLM-L12-v2</code> (384-d Cosine) rodando localmente em CPU/GPU.</li>
+                    <li><strong>Indexação Única:</strong> O ChromaDB é indexado uma única vez sem gastar cota de API e atende Qwen, Gemini, ChatGPT e Claude.</li>
+                    <li><strong>Latência em Milissegundos:</strong> Vetorização de queries e fusão RRF com BM25 ocorrem em menos de 100 ms.</li>
                 </ul>
             </div>
             <div class="arch-card">
-                <h4>⚖️ 3. Busca Híbrida RRF + Cross-Reference (<code>src/rag/engine.py</code>)</h4>
+                <h4>⚖️ 3. Context Budget & Cross-Reference (<code>src/rag/engine.py</code>)</h4>
                 <ul>
-                    <li><strong>Reciprocal Rank Fusion (RRF):</strong> Combina busca vetorial no <code>ChromaDB</code> (métrica <code>cosine</code> com <code>RETRIEVAL_QUERY</code>) e busca lexical <code>BM25Okapi</code>.</li>
-                    <li><strong>Expansão de Referências Cruzadas:</strong> Identifica os dispositivos em <code>artigos_citados</code> dos chunks Top-K e anexa automaticamente até 2 artigos complementares via filtro de metadado.</li>
+                    <li><strong>Orçamento Enxuto:</strong> Recupera <code>top_k=4</code> chunks via RRF + até <code>1</code> artigo complementar de referência cruzada.</li>
+                    <li><strong>Reescrita Condicional:</strong> Evita chamadas duplas de LLM quando a pergunta tem 5+ palavras sem pronomes ambíguos.</li>
                 </ul>
             </div>
             """,
@@ -761,19 +885,18 @@ def _render_project_details_page(engine: LGPDRagEngine) -> None:
         st.markdown(
             """
             <div class="arch-card">
-                <h4>🧩 2. Parser Semântico-Estrutural (<code>src/ingestion/parser.py</code>)</h4>
+                <h4>🤖 2. Padrão Strategy/Factory Multi-Provedor (<code>src/rag/providers.py</code>)</h4>
                 <ul>
-                    <li><strong>Remoção de Trechos Revogados:</strong> Decompõe tags <code>&lt;strike&gt;</code>, <code>&lt;s&gt;</code>, <code>&lt;del&gt;</code> e estilos CSS <code>line-through</code>.</li>
-                    <li><strong>Chunk Atômico por Artigo:</strong> Preserva <code>caput</code>, incisos, alíneas e parágrafos juntos (79 artigos: <code>Art. 1º</code> a <code>Art. 65</code> + <code>Art. 55-A</code> a <code>55-L</code> e <code>58-A/B</code>).</li>
-                    <li><strong>Tabelas ANPD em Markdown:</strong> Extrai PDFs com <code>pymupdf4llm.to_markdown(page_chunks=True)</code> (~1800 caracteres, overlap 250).</li>
+                    <li><strong>OllamaProvider (Padrão):</strong> Conecta ao servidor local Ollama (<code>qwen2.5:7b</code>, <code>qwen2.5:3b</code>, <code>qwen2.5:14b</code>) 100% offline.</li>
+                    <li><strong>Cloud BYOK:</strong> Suporte nativo em streaming para <code>google-genai</code> (Gemini), <code>openai</code> (ChatGPT) e <code>anthropic</code> (Claude).</li>
+                    <li><strong>Temperatura Padronizada:</strong> Todos os provedores operam com <code>temperature=0.1</code> para rigor normativo.</li>
                 </ul>
             </div>
             <div class="arch-card">
-                <h4>✨ 4. Geração & Auditoria Transparente (<code>src/app.py</code>)</h4>
+                <h4>⚡ 4. Streaming Nativo & Telemetria TTFT (<code>src/app.py</code>)</h4>
                 <ul>
-                    <li><strong>SDK Oficial Exclusivo:</strong> Usa <code>from google import genai</code> e <code>from google.genai import types</code> com autenticação BYOK em sessão.</li>
-                    <li><strong>Modelo Único Padronizado:</strong> Configurado em <code>gemini-3.8-flash</code> (<code>temperature=0.1</code>) com failover resiliente contra picos 503.</li>
-                    <li><strong>Inspeção Completa:</strong> Exibe em cada resposta o prompt enviado, a tag XML <code>&lt;contexto_normativo&gt;</code>, a latência e os scores de recuperação.</li>
+                    <li><strong>Cache de Recursos:</strong> <code>@st.cache_resource</code> mantém SentenceTransformer, ChromaDB e BM25 em RAM.</li>
+                    <li><strong>Renderização Imediata:</strong> Usa <code>st.write_stream</code> com medição em tempo real de Recuperação (ms) e TTFT (Time To First Token).</li>
                 </ul>
             </div>
             """,
@@ -805,6 +928,114 @@ def _render_project_details_page(engine: LGPDRagEngine) -> None:
             st.code(selected_chunk["texto"], language="markdown")
 
 
+def _render_sidebar_provider_controls() -> None:
+    """Renderiza o seletor Multi-Provedor e controles condicionais de Ollama ou BYOK na Sidebar."""
+    st.markdown("##### 🤖 Provedor de IA")
+
+    provider_options = list(PROVIDER_LABELS.keys())
+    current_idx = (
+        provider_options.index(st.session_state["provider_key"])
+        if st.session_state["provider_key"] in provider_options
+        else 0
+    )
+
+    selected_provider_label = st.selectbox(
+        "Provedor de IA",
+        options=[PROVIDER_LABELS[k] for k in provider_options],
+        index=current_idx,
+        label_visibility="collapsed",
+    )
+    provider_key = normalize_provider_key(selected_provider_label)
+    st.session_state["provider_key"] = provider_key
+
+    if provider_key == "ollama":
+        preset_choice = st.selectbox(
+            "Modelo Qwen (Ollama Local)",
+            options=OLLAMA_MODELS + ["Outra tag local..."],
+            index=0,
+            help="qwen2.5:7b (padrão equilibrado), qwen2.5:3b (modo ultra-rápido), qwen2.5:14b ou digite qualquer tag.",
+        )
+        if preset_choice == "Outra tag local...":
+            custom_tag = st.text_input(
+                "Tag do modelo no Ollama",
+                value=st.session_state["custom_ollama_tag"] or "qwen3:8b",
+                placeholder="Ex: qwen3:8b",
+            ).strip()
+            st.session_state["custom_ollama_tag"] = custom_tag
+            st.session_state["selected_model"] = custom_tag or "qwen2.5:7b"
+        else:
+            st.session_state["selected_model"] = preset_choice
+
+        with st.expander("⚙️ Endpoint Ollama", expanded=False):
+            st.session_state["ollama_base_url"] = st.text_input(
+                "URL do Servidor Ollama",
+                value=st.session_state["ollama_base_url"],
+                placeholder="http://localhost:11434",
+            ).strip() or DEFAULT_OLLAMA_URL
+
+        status = check_ollama_status(
+            base_url=st.session_state["ollama_base_url"],
+            model_name=st.session_state["selected_model"],
+        )
+        if status["online"] and status["model_ready"]:
+            st.success(status["message"])
+        elif status["online"]:
+            st.warning(status["message"])
+        else:
+            st.info(status["message"])
+
+    elif provider_key == "gemini":
+        st.session_state["selected_model"] = st.selectbox(
+            "Modelo Google Gemini",
+            options=GEMINI_MODELS,
+            index=0,
+        )
+        key_val = st.text_input(
+            "🔑 Gemini API Key (BYOK)",
+            value=st.session_state["api_keys"].get("gemini", ""),
+            type="password",
+            placeholder="AIzaSy...",
+            help="Mantida exclusivamente em st.session_state durante sua sessão.",
+        ).strip()
+        st.session_state["api_keys"]["gemini"] = key_val
+        st.session_state["gemini_api_key"] = key_val
+
+    elif provider_key == "openai":
+        st.session_state["selected_model"] = st.selectbox(
+            "Modelo OpenAI (ChatGPT)",
+            options=OPENAI_MODELS,
+            index=0,
+        )
+        key_val = st.text_input(
+            "🔑 OpenAI API Key (BYOK)",
+            value=st.session_state["api_keys"].get("openai", ""),
+            type="password",
+            placeholder="sk-...",
+            help="Mantida exclusivamente em st.session_state durante sua sessão.",
+        ).strip()
+        st.session_state["api_keys"]["openai"] = key_val
+
+    elif provider_key == "anthropic":
+        st.session_state["selected_model"] = st.selectbox(
+            "Modelo Anthropic (Claude)",
+            options=ANTHROPIC_MODELS,
+            index=0,
+        )
+        key_val = st.text_input(
+            "🔑 Anthropic API Key (BYOK)",
+            value=st.session_state["api_keys"].get("anthropic", ""),
+            type="password",
+            placeholder="sk-ant-...",
+            help="Mantida exclusivamente em st.session_state durante sua sessão.",
+        ).strip()
+        st.session_state["api_keys"]["anthropic"] = key_val
+
+    st.caption(
+        f"🧠 **Embeddings Locais:** `MiniLM-L12-v2`\n\n"
+        f"🎯 **Context Budget:** `Top-{DEFAULT_TOP_K}` + `{DEFAULT_MAX_CROSS_REFS}` Cross-Ref (`temp=0.1`)"
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="LGPD.AI — Assistente Inteligente LGPD & ANPD",
@@ -813,15 +1044,14 @@ def main() -> None:
     )
     _inject_lix_inspired_css()
     _init_session_state()
-    engine: LGPDRagEngine = st.session_state["rag_engine"]
+    engine = get_cached_rag_engine()
 
-    # ==================== BARRA LATERAL MINIMALISTA (ESTILO LIX) ====================
     with st.sidebar:
         st.markdown(
             '<div class="brand-logo"><span class="brand-dot"></span>LGPD.AI</div>',
             unsafe_allow_html=True,
         )
-        st.caption("Conformidade LGPD & ANPD")
+        st.caption("Conformidade LGPD & ANPD • Multi-LLM")
 
         page = st.radio(
             "Navegação",
@@ -834,25 +1064,10 @@ def main() -> None:
         )
 
         st.divider()
-        st.markdown("##### 🔐 Autenticação BYOK")
-        user_key = st.text_input(
-            "🔑 Gemini API Key",
-            value=st.session_state["gemini_api_key"],
-            type="password",
-            placeholder="AIzaSy...",
-            help="Mantida exclusivamente em st.session_state durante sua sessão.",
-        )
-        st.session_state["gemini_api_key"] = user_key.strip()
-        engine.api_key = st.session_state["gemini_api_key"]
-        st.session_state["selected_model"] = DEFAULT_GENERATION_MODEL
-
-        st.caption(
-            f"✨ **Modelo:** `{DEFAULT_GENERATION_MODEL}` (`temp=0.1`)\n\n"
-            f"🧠 **Embeddings:** `{EMBEDDING_MODEL}`"
-        )
+        _render_sidebar_provider_controls()
 
         st.divider()
-        st.markdown("##### 🗄️ Base Normativa")
+        st.markdown("##### 🗄️ Base Normativa Local")
         indexed_count = engine.get_indexed_count()
         jsonl_count = len(engine.chunks)
         col_m1, col_m2 = st.columns(2)
@@ -864,38 +1079,33 @@ def main() -> None:
             use_container_width=True,
             type="primary",
         ):
-            if not st.session_state["gemini_api_key"]:
-                st.error("Insira sua Gemini API Key acima antes de indexar.")
-            else:
-                with st.status(
-                    "Sincronizando LGPD + Resoluções ANPD...", expanded=True
-                ) as status_box:
-                    st.write("🌐 1/3 Coleta com SHA-256 e fallback local...")
-                    fetch_report = run_ingestion_fetcher(raw_dir=DEFAULT_RAW_DIR)
-                    if fetch_report["overall_status"] != "ok":
-                        st.warning("Contingência local utilizada para arquivos gov.br.")
+            with st.status(
+                "Sincronizando LGPD + Resoluções ANPD (100% Local)...", expanded=True
+            ) as status_box:
+                st.write("🌐 1/3 Coleta com SHA-256 e fallback local...")
+                fetch_report = run_ingestion_fetcher(raw_dir=DEFAULT_RAW_DIR)
+                if fetch_report["overall_status"] != "ok":
+                    st.warning("Contingência local utilizada para arquivos gov.br.")
 
-                    st.write("🧩 2/3 Executando Parser Semântico-Estrutural...")
-                    chunks = run_parser_pipeline(
-                        raw_dir=DEFAULT_RAW_DIR, output_jsonl=DEFAULT_OUTPUT_JSONL
+                st.write("🧩 2/3 Executando Parser Semântico-Estrutural...")
+                chunks = run_parser_pipeline(
+                    raw_dir=DEFAULT_RAW_DIR, output_jsonl=DEFAULT_OUTPUT_JSONL
+                )
+                st.write(f"Extraídos {len(chunks)} chunks normativos.")
+
+                st.write(f"🧠 3/3 Indexando localmente com `{LOCAL_EMBEDDING_MODEL}`...")
+                try:
+                    total_indexed = engine.index_chunks()
+                    status_box.update(
+                        label=f"✅ {total_indexed} chunks indexados localmente!",
+                        state="complete",
                     )
-                    st.write(f"Extraídos {len(chunks)} chunks normativos.")
-
-                    st.write(f"🧠 3/3 Indexando no ChromaDB (`{EMBEDDING_MODEL}`)...")
-                    try:
-                        total_indexed = engine.index_chunks(
-                            api_key=st.session_state["gemini_api_key"]
-                        )
-                        status_box.update(
-                            label=f"✅ {total_indexed} chunks indexados!",
-                            state="complete",
-                        )
-                        st.rerun()
-                    except Exception as exc:
-                        status_box.update(
-                            label="❌ Erro na indexação", state="error"
-                        )
-                        st.error(f"Falha ao gerar embeddings: {exc}")
+                    st.rerun()
+                except Exception as exc:
+                    status_box.update(
+                        label="❌ Erro na indexação", state="error"
+                    )
+                    st.error(f"Falha ao indexar base: {exc}")
 
         with st.expander("📎 Importar PDF da ANPD", expanded=False):
             uploaded_files = st.file_uploader(
@@ -920,7 +1130,6 @@ def main() -> None:
             st.session_state["pending_suggestion"] = None
             st.rerun()
 
-    # ==================== ROTEAMENTO DE PÁGINAS ====================
     if page == "🏠 Início & Chat Consultivo":
         _render_chat_page(engine)
     else:

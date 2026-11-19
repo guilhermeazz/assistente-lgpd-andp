@@ -175,10 +175,8 @@ def test_anpd_pdf_chunks_and_hybrid_retrieval_with_cross_ref_expansion(
     """
     Prova que:
     - PDFs da ANPD foram extraídos via pymupdf4llm e possuem Breadcrumb [Nome | Página X]
-    - O motor RAG Híbrido (ChromaDB cosine + BM25 via RRF) recupera chunks relevantes
-    - A expansão automática de referência cruzada anexa até 2 artigos citados no Top-K
-    - O SDK `google-genai` é invocado com `task_type="RETRIEVAL_DOCUMENT"` na indexação
-      e `task_type="RETRIEVAL_QUERY"` na busca.
+    - O motor RAG Híbrido (ChromaDB cosine + SentenceTransformers Local + BM25 via RRF) recupera chunks relevantes
+    - A expansão automática de referência cruzada anexa artigos citados no Top-K
     """
     anpd_chunks = [
         c for c in parsed_chunks if c.get("metadata", {}).get("tipo") == "anpd_pdf"
@@ -187,7 +185,6 @@ def test_anpd_pdf_chunks_and_hybrid_retrieval_with_cross_ref_expansion(
     assert "| Página " in anpd_chunks[0]["texto"].splitlines()[0]
 
     engine = LGPDRagEngine(
-        api_key="test-session-key",
         chunks_path=DEFAULT_OUTPUT_JSONL,
         in_memory_chroma=True,
     )
@@ -195,48 +192,24 @@ def test_anpd_pdf_chunks_and_hybrid_retrieval_with_cross_ref_expansion(
     # Verifica que a coleção do ChromaDB usa métrica cosine
     assert engine.collection.metadata.get("hnsw:space") == "cosine"
 
-    # Mocka o client do SDK oficial google-genai para validar EmbedContentConfig(task_type=...)
-    captured_task_types: List[str] = []
+    total_indexed = engine.index_chunks(use_mock_embeddings=True)
+    assert total_indexed == len(parsed_chunks)
 
-    def fake_embed_content(model: str, contents: Any, config: Any) -> Any:
-        assert model == "text-embedding-004"
-        captured_task_types.append(config.task_type)
-        items = contents if isinstance(contents, list) else [contents]
-        mock_resp = MagicMock()
-        mock_embs = []
-        for text_item in items:
-            emb_obj = MagicMock()
-            emb_obj.values = engine._deterministic_test_embedding(str(text_item))
-            mock_embs.append(emb_obj)
-        mock_resp.embeddings = mock_embs
-        return mock_resp
+    # Executa busca híbrida sobre consentimento e revogação (Art. 8º cita Art. 7º, Art. 18, Art. 9º)
+    results = engine.hybrid_search_with_cross_ref(
+        query="Art. 8º revogação do consentimento ônus da prova cláusula destacada",
+        top_k=4,
+        max_cross_refs=1,
+        use_mock_embeddings=True,
+    )
+    assert len(results) >= 4
 
-    with patch.object(engine, "_get_genai_client") as mock_get_client:
-        mock_client = MagicMock()
-        mock_client.models.embed_content.side_effect = fake_embed_content
-        mock_get_client.return_value = mock_client
+    top_articles = [r["metadata"].get("artigo") for r in results if not r["is_cross_reference"]]
+    assert "Art. 8º" in top_articles
 
-        total_indexed = engine.index_chunks(api_key="test-session-key")
-        assert total_indexed == len(parsed_chunks)
-        assert "RETRIEVAL_DOCUMENT" in captured_task_types
-
-        # Executa busca híbrida sobre consentimento e revogação (Art. 8º cita Art. 7º, Art. 18, Art. 9º)
-        results = engine.hybrid_search_with_cross_ref(
-            query="Art. 8º revogação do consentimento ônus da prova cláusula destacada",
-            top_k=3,
-            max_cross_refs=2,
-            api_key="test-session-key",
-        )
-        assert "RETRIEVAL_QUERY" in captured_task_types
-        assert len(results) >= 3
-
-        top_articles = [r["metadata"].get("artigo") for r in results if not r["is_cross_reference"]]
-        assert "Art. 8º" in top_articles
-
-        cross_refs = [r for r in results if r["is_cross_reference"]]
-        assert 1 <= len(cross_refs) <= 2, "Deve anexar até 2 artigos complementares por referência cruzada."
-        for cr in cross_refs:
-            assert "Referência Cruzada Automática" in cr["origem"]
+    cross_refs = [r for r in results if r["is_cross_reference"]]
+    assert len(cross_refs) == 1, "Deve anexar no máximo 1 artigo complementar por referência cruzada."
+    assert "Referência Cruzada Automática" in cross_refs[0]["origem"]
 
 
 def test_cloud_waf_self_healing_guarantees_all_lgpd_articles(tmp_path: Path) -> None:
