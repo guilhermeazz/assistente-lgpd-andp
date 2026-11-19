@@ -1,7 +1,7 @@
 """
 Arquitetura Multi-Provedor LLM (src/rag/providers.py)
 Implementa o padrão Strategy/Factory com streaming nativo de tokens e temperature=0.1:
-1. OllamaProvider (Padrão - 100% Local/Offline com Qwen via Ollama, com failover transparente para
+1. OllamaProvider (100% Local/Offline com Qwen via Ollama, com failover transparente para
    Qwen no Hugging Face GPU quando rodando no Streamlit Cloud com HF_TOKEN configurado)
 2. HuggingFaceQwenProvider (Qwen hospedado nas GPUs do Hugging Face via st.secrets["HF_TOKEN"],
    sem exigir que o usuário final digite chave de API na interface)
@@ -43,8 +43,8 @@ DEFAULT_HF_ROUTER_URL = "https://router.huggingface.co/v1"
 DEFAULT_TEMPERATURE = 0.1
 
 PROVIDER_LABELS: Dict[str, str] = {
-    "ollama": "Qwen (Local - Ollama) [Padrão]",
     "huggingface": "Qwen (Hugging Face GPU - Sem Chave)",
+    "ollama": "Qwen (Local - Ollama)",
     "gemini": "Google Gemini (API Key)",
     "openai": "OpenAI / ChatGPT (API Key)",
     "anthropic": "Anthropic / Claude (API Key)",
@@ -57,9 +57,10 @@ OLLAMA_MODELS: List[str] = [
 ]
 
 HF_QWEN_MODELS: List[str] = [
-    "Qwen/Qwen2.5-72B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-32B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct:fastest",
+    "Qwen/Qwen2.5-72B-Instruct:fastest",
+    "Qwen/Qwen2.5-32B-Instruct:fastest",
+    "Qwen/Qwen3-8B:fastest",
 ]
 
 GEMINI_MODELS: List[str] = [
@@ -81,7 +82,7 @@ ANTHROPIC_MODELS: List[str] = [
 
 PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
     "ollama": "qwen2.5:7b",
-    "huggingface": "Qwen/Qwen2.5-72B-Instruct",
+    "huggingface": "Qwen/Qwen2.5-7B-Instruct:fastest",
     "gemini": "gemini-2.5-flash",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-3-5-haiku-latest",
@@ -114,6 +115,29 @@ def get_configured_hf_token(explicit_token: Optional[str] = None) -> Optional[st
         pass
 
     return None
+
+
+def _discover_hf_qwen_models(token: str, base_url: str = DEFAULT_HF_ROUTER_URL) -> List[str]:
+    """Consulta `/v1/models` no Hugging Face Router para localizar modelos Qwen habilitados na conta."""
+    try:
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=4.0,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json().get("data", []) or []
+        qwen_ids = [
+            str(item.get("id", "")).strip()
+            for item in data
+            if "qwen" in str(item.get("id", "")).lower()
+            and "embed" not in str(item.get("id", "")).lower()
+            and "vl" not in str(item.get("id", "")).lower()
+        ]
+        return qwen_ids[:4]
+    except Exception:
+        return []
 
 
 def normalize_provider_key(provider_name: str) -> str:
@@ -254,14 +278,14 @@ class HuggingFaceQwenProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-72B-Instruct",
+        model_name: str = "Qwen/Qwen2.5-7B-Instruct:fastest",
         api_key: Optional[str] = None,
         temperature: float = DEFAULT_TEMPERATURE,
         base_url: str = DEFAULT_HF_ROUTER_URL,
     ) -> None:
         resolved_token = get_configured_hf_token(api_key)
         super().__init__(
-            model_name=model_name or "Qwen/Qwen2.5-72B-Instruct",
+            model_name=model_name or "Qwen/Qwen2.5-7B-Instruct:fastest",
             temperature=temperature,
             api_key=resolved_token,
             base_url=base_url or DEFAULT_HF_ROUTER_URL,
@@ -283,62 +307,107 @@ class HuggingFaceQwenProvider(BaseLLMProvider):
                 "nem nas variáveis de ambiente. Configure `HF_TOKEN = \"hf_...\"` nos Secrets do projeto."
             )
 
+        endpoint = (self.base_url or DEFAULT_HF_ROUTER_URL).rstrip("/")
+        client = OpenAI(base_url=endpoint, api_key=token)
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
+        # Garante variantes com sufixo `:fastest` e sem sufixo para evitar HTTP 400 (model_not_supported)
+        raw_candidates: List[str] = [self.model_name]
+        if ":" not in self.model_name:
+            raw_candidates.insert(0, f"{self.model_name}:fastest")
+        raw_candidates.extend(
+            [
+                "Qwen/Qwen2.5-7B-Instruct:fastest",
+                "Qwen/Qwen2.5-72B-Instruct:fastest",
+                "Qwen/Qwen2.5-32B-Instruct:fastest",
+                "Qwen/Qwen2.5-7B-Instruct",
+                "Qwen/Qwen2.5-72B-Instruct",
+            ]
+        )
+
         candidate_models: List[str] = []
-        for m in (
-            self.model_name,
-            "Qwen/Qwen2.5-72B-Instruct",
-            "Qwen/Qwen2.5-7B-Instruct",
-            "Qwen/Qwen2.5-32B-Instruct",
-        ):
+        for m in raw_candidates:
             if m and m not in candidate_models:
                 candidate_models.append(m)
 
+        # Orçamento seguro de saída (768 tokens) para não ultrapassar janelas de 4.096 tokens
+        primary_budget = int(max_tokens) if max_tokens is not None else 768
+        token_budgets = [primary_budget] if max_tokens is not None else [768, 450]
+
         last_exc: Optional[Exception] = None
-        for candidate_model in candidate_models:
-            endpoints = [
-                (self.base_url or DEFAULT_HF_ROUTER_URL).rstrip("/"),
-                f"https://router.huggingface.co/hf-inference/models/{candidate_model}/v1",
-            ]
-            for ep in endpoints:
-                try:
-                    client = OpenAI(base_url=ep, api_key=token)
-                    stream = client.chat.completions.create(
-                        model=candidate_model,
-                        messages=messages,
-                        temperature=self.temperature,
-                        max_tokens=int(max_tokens) if max_tokens is not None else 1536,
-                        stream=True,
-                    )
-                    yielded_any = False
-                    for event in stream:
-                        if (
-                            event.choices
-                            and event.choices[0].delta
-                            and event.choices[0].delta.content
-                        ):
-                            yielded_any = True
-                            yield event.choices[0].delta.content
-                    if yielded_any:
-                        self.model_name = candidate_model
-                        return
-                except Exception as exc:
-                    last_exc = exc
-                    err_lower = str(exc).lower()
-                    if any(k in err_lower for k in ("401", "unauthorized", "invalid token")):
-                        raise ValueError(
-                            "Token `HF_TOKEN` inválido ou sem permissão 'Make calls to Inference Providers' no Hugging Face."
-                        ) from exc
-                    logger.warning(
-                        "Tentando próximo endpoint/modelo Qwen no Hugging Face GPU (%s -> %s): %s",
-                        candidate_model,
-                        ep,
-                        exc,
-                    )
+
+        def _try_models(models_to_try: List[str]) -> Generator[str, None, bool]:
+            nonlocal last_exc
+            for candidate_model in models_to_try:
+                for budget in token_budgets:
+                    try:
+                        stream = client.chat.completions.create(
+                            model=candidate_model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=budget,
+                            stream=True,
+                        )
+                        yielded_any = False
+                        for event in stream:
+                            if (
+                                event.choices
+                                and event.choices[0].delta
+                                and event.choices[0].delta.content
+                            ):
+                                yielded_any = True
+                                yield event.choices[0].delta.content
+                        if yielded_any:
+                            self.model_name = candidate_model
+                            return True
+                    except Exception as exc:
+                        last_exc = exc
+                        err_lower = str(exc).lower()
+                        if any(k in err_lower for k in ("401", "unauthorized", "invalid token")):
+                            raise ValueError(
+                                "Token `HF_TOKEN` inválido ou sem permissão 'Make calls to Inference Providers' no Hugging Face."
+                            ) from exc
+                        # Se o erro 400 for estouro de contexto/tokens, tenta o próximo budget menor no mesmo modelo
+                        if any(k in err_lower for k in ("max_new_tokens", "max_tokens", "context", "4096")):
+                            logger.warning(
+                                "Ajustando max_tokens para %s devido a limite de janela (%s).",
+                                candidate_model,
+                                exc,
+                            )
+                            continue
+                        logger.warning(
+                            "Modelo Qwen indisponível no Hugging Face Router (%s): %s",
+                            candidate_model,
+                            exc,
+                        )
+                        break
+            return False
+
+        # 1. Tenta a lista prioritária de modelos Qwen
+        gen = _try_models(candidate_models)
+        try:
+            while True:
+                yield next(gen)
+        except StopIteration as stop:
+            if stop.value:
+                return
+
+        # 2. Descoberta dinâmica via `/v1/models` caso os modelos fixos não estejam habilitados na conta
+        discovered = [
+            m for m in _discover_hf_qwen_models(token, endpoint) if m not in candidate_models
+        ]
+        if discovered:
+            gen_disc = _try_models(discovered)
+            try:
+                while True:
+                    yield next(gen_disc)
+            except StopIteration as stop:
+                if stop.value:
+                    return
 
         if last_exc is not None:
             raise last_exc
@@ -347,7 +416,7 @@ class HuggingFaceQwenProvider(BaseLLMProvider):
 
 class OllamaProvider(BaseLLMProvider):
     """
-    Provedor Local Padrão conectando ao servidor Ollama (`http://localhost:11434`)
+    Provedor Local conectando ao servidor Ollama (`http://localhost:11434`)
     para execução 100% offline/local da família Qwen (`qwen2.5:7b`, `qwen2.5:3b`, `qwen2.5:14b`, etc.).
     Se o Ollama local estiver indisponível (ex: deploy no Streamlit Cloud) e `HF_TOKEN` estiver
     configurado nos Secrets, faz failover transparente para o Qwen nas GPUs do Hugging Face.
@@ -421,8 +490,6 @@ class OllamaProvider(BaseLLMProvider):
                 return
             except Exception as exc:
                 err_msg = str(exc)
-                # Se o Ollama local estiver offline (ex: Streamlit Cloud) e houver HF_TOKEN nos Secrets,
-                # redireciona automaticamente para o Qwen nas GPUs do Hugging Face!
                 hf_token = get_configured_hf_token(self.api_key)
                 if hf_token and any(
                     k in err_msg.lower()
@@ -433,7 +500,7 @@ class OllamaProvider(BaseLLMProvider):
                         err_msg,
                     )
                     hf_provider = HuggingFaceQwenProvider(
-                        model_name="Qwen/Qwen2.5-72B-Instruct",
+                        model_name="Qwen/Qwen2.5-7B-Instruct:fastest",
                         api_key=hf_token,
                         temperature=self.temperature,
                     )
@@ -695,7 +762,7 @@ class LLMProviderFactory:
 
     @staticmethod
     def create(
-        provider_name: str = "ollama",
+        provider_name: str = "huggingface",
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
         base_url: str = DEFAULT_OLLAMA_URL,
@@ -739,7 +806,7 @@ class LLMProviderFactory:
 
 
 def create_llm_provider(
-    provider_name: str = "ollama",
+    provider_name: str = "huggingface",
     model_name: Optional[str] = None,
     api_key: Optional[str] = None,
     base_url: str = DEFAULT_OLLAMA_URL,
