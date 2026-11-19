@@ -43,7 +43,6 @@ DEFAULT_HF_ROUTER_URL = "https://router.huggingface.co/v1"
 DEFAULT_TEMPERATURE = 0.1
 
 PROVIDER_LABELS: Dict[str, str] = {
-    "huggingface": "Qwen (Hugging Face GPU - Sem Chave)",
     "ollama": "Qwen (Local - Ollama)",
     "gemini": "Google Gemini (API Key)",
     "openai": "OpenAI / ChatGPT (API Key)",
@@ -64,9 +63,7 @@ HF_QWEN_MODELS: List[str] = [
 ]
 
 GEMINI_MODELS: List[str] = [
-    "gemini-2.5-flash",
     "gemini-3.8-flash",
-    "gemini-2.0-flash",
 ]
 
 OPENAI_MODELS: List[str] = [
