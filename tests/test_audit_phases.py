@@ -234,7 +234,7 @@ def test_phase4_and_phase5_generate_stream_contract_fast_path_and_prompt_compres
     assert extract_direct_article_references("Como funciona o Art. 55-J da LGPD?") == ["Art. 55-J"]
 
     # 3. Verifica streaming via generate_stream(messages) e telemetria no ask_stream
-    mock_prov = MockStreamingProvider(model_name="gemini-2.0-flash")  # economic tier
+    mock_prov = MockStreamingProvider(model_name="gemini-2.5-flash-lite")  # economic tier
     chunks_streamed = list(
         mock_prov.generate_stream(
             [
@@ -348,3 +348,106 @@ def test_phase7_architecture_pipeline_and_c4_level3_diagram() -> None:
         "ChromaDB",
     ):
         assert m_comp in c4_mermaid, f"Componente ausente no Mermaid C4 Nível 3: {m_comp}"
+
+
+def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
+    """
+    Valida a correção do Gemini 3.8 + remoção do gemini-2.0-flash descontinuado + alertas de cota/limite de API:
+    - `gemini-2.0-flash` não existe mais no catálogo nem nos fallbacks do GeminiProvider.
+    - `GeminiProvider(model_name="gemini-3.8-flash")` não envia `thinking_budget=0` incompatível
+      e nunca tenta `gemini-2.0-flash` em caso de erro.
+    - Erros de estouro de cota/limite (429 / RESOURCE_EXHAUSTED / insufficient_quota / credit balance)
+      interrompem imediatamente o fallback e são classificados como `quota` com orientação clara.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from src.rag.providers import (
+        MODEL_CATALOG,
+        GeminiProvider,
+        classify_api_error,
+        is_quota_limit_error,
+    )
+
+    assert "gemini-2.0-flash" not in MODEL_CATALOG["gemini"]
+    assert "gemini-2.0-flash" not in get_selectable_models("gemini")
+    assert "gemini-3.8-flash" in get_selectable_models("gemini")
+    assert "gemini-2.5-flash-lite" in get_selectable_models("gemini")
+
+    # 1. Gemini 3.8 Flash deve chamar generate_content_stream SEM thinking_config=thinking_budget(0)
+    captured_calls = []
+
+    class _FakeModelsOK:
+        def generate_content_stream(self, model, contents, config):
+            captured_calls.append((model, getattr(config, "thinking_config", None)))
+            return iter([SimpleNamespace(text="Resposta via "), SimpleNamespace(text="Gemini 3.8.")])
+
+    fake_client_ok = SimpleNamespace(models=_FakeModelsOK())
+    prov_ok = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
+    with patch.object(prov_ok, "_get_client", return_value=fake_client_ok):
+        out = "".join(prov_ok.stream_generate("sys", "user"))
+    assert out == "Resposta via Gemini 3.8."
+    assert captured_calls == [("gemini-3.8-flash", None)]
+
+    # 2. Se gemini-3.8-flash retornar 404, nunca deve chamar o descontinuado gemini-2.0-flash
+    attempted_models = []
+
+    class _FakeModels404:
+        def generate_content_stream(self, model, contents, config):
+            attempted_models.append(model)
+            if model == "gemini-3.8-flash":
+                raise RuntimeError("404 NOT_FOUND: model unavailable in region")
+            return iter([SimpleNamespace(text="Fallback ativo funcionando.")])
+
+    prov_fb = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
+    with patch.object(prov_fb, "_get_client", return_value=SimpleNamespace(models=_FakeModels404())):
+        out_fb = "".join(prov_fb.stream_generate("sys", "user"))
+    assert out_fb == "Fallback ativo funcionando."
+    assert "gemini-2.0-flash" not in attempted_models
+    assert attempted_models == ["gemini-3.8-flash", "gemini-2.5-flash"]
+
+    # 3. Se estourar o limite da API (429 / RESOURCE_EXHAUSTED), deve interromper imediatamente sem mascarar com 404
+    quota_attempts = []
+
+    class _FakeModels429:
+        def generate_content_stream(self, model, contents, config):
+            quota_attempts.append(model)
+            raise RuntimeError("429 RESOURCE_EXHAUSTED: You exceeded your current quota, please check your plan.")
+
+    prov_429 = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
+    with patch.object(prov_429, "_get_client", return_value=SimpleNamespace(models=_FakeModels429())):
+        try:
+            list(prov_429.stream_generate("sys", "user"))
+            assert False, "Esperava exceção de limite de cota (429)."
+        except RuntimeError as exc:
+            assert is_quota_limit_error(exc)
+            info = classify_api_error(exc, provider_id="gemini", using_user_key=True)
+            assert info["category"] == "quota"
+            assert "Limite da sua API atingido" in info["message"]
+            assert "da sua chave de API" in info["message"]
+            assert "aistudio.google.com/usage" in info["action_hint"]
+    assert quota_attempts == ["gemini-3.8-flash"]
+
+    # 4. Verifica detecção de estouro de cota para OpenAI e Anthropic + erro 404 amigável
+    oai_info = classify_api_error(
+        RuntimeError("Error code: 429 - insufficient_quota: You exceeded your current quota"),
+        provider_id="openai",
+        using_user_key=True,
+    )
+    assert oai_info["category"] == "quota"
+    assert "platform.openai.com/usage" in oai_info["action_hint"]
+
+    ant_info = classify_api_error(
+        RuntimeError("Your credit balance is too low to access the Anthropic API."),
+        provider_id="anthropic",
+        using_user_key=True,
+    )
+    assert ant_info["category"] == "quota"
+    assert "console.anthropic.com/settings/limits" in ant_info["action_hint"]
+
+    err_404 = format_friendly_api_error(
+        RuntimeError("404 NOT_FOUND: This model models/gemini-2.0-flash is no longer available."),
+        provider_id="gemini",
+    )
+    assert "Erro 404" in err_404
+    assert "no longer available" not in err_404

@@ -11,6 +11,7 @@ import streamlit as st
 from src.rag.engine import LGPDRagEngine
 from src.rag.prompts import LANGUAGE_LEVEL_LABELS, SYSTEM_PROMPT
 from src.rag.providers import (
+    classify_api_error,
     format_friendly_api_error,
     get_provider_api_key,
     preflight_check_provider,
@@ -254,5 +255,25 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
             st.session_state["messages"].append(msg_record)
 
         except Exception as exc:
-            friendly_err = format_friendly_api_error(exc, provider_id=provider_key)
-            st.error(friendly_err)
+            using_user_key = bool((user_api_key or "").strip())
+            err_info = classify_api_error(
+                exc,
+                provider_id=provider_key,
+                using_user_key=using_user_key,
+            )
+            if err_info["category"] == "quota":
+                if hasattr(st, "toast"):
+                    st.toast(
+                        "⏳ Limite da sua API atingido! Verifique sua cota ou troque o modelo.",
+                        icon="⏳",
+                    )
+                st.error(err_info["message"])
+                if err_info["action_hint"]:
+                    st.warning(err_info["action_hint"])
+            else:
+                friendly_err = format_friendly_api_error(
+                    exc,
+                    provider_id=provider_key,
+                    using_user_key=using_user_key,
+                )
+                st.error(friendly_err)

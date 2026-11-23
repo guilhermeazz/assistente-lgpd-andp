@@ -90,10 +90,10 @@ MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
             "label": "Gemini 3.8 Flash (Recomendado)",
             "context_window": 1000000,
         },
-        "gemini-2.0-flash": {
+        "gemini-2.5-flash-lite": {
             **TIER_DEFAULTS["economic"],
-            "label": "Gemini 2.0 Flash (Econômico)",
-            "context_window": 128000,
+            "label": "Gemini 2.5 Flash-Lite (Econômico / Ultra-Rápido)",
+            "context_window": 1000000,
         },
         "gemini-nano-legacy": {
             **TIER_DEFAULTS["unsupported"],
@@ -435,41 +435,181 @@ def scrub_sensitive_keys(text: str) -> str:
     return scrubbed
 
 
-def format_friendly_api_error(exc: Exception, provider_id: str = "") -> str:
+PROVIDER_USAGE_URLS: Dict[str, str] = {
+    "gemini": "https://aistudio.google.com/usage",
+    "openai": "https://platform.openai.com/usage",
+    "anthropic": "https://console.anthropic.com/settings/limits",
+}
+
+QUOTA_ERROR_PATTERNS: Tuple[str, ...] = (
+    "429",
+    "resource_exhausted",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota",
+    "insufficient_quota",
+    "exceeded your current quota",
+    "credit balance is too low",
+    "insufficient credits",
+    "billing_hard_limit",
+    "spending limit",
+    "usage limit",
+    "requests per minute",
+    "requests per day",
+    "tokens per minute",
+    "limit: 0",
+)
+
+HARD_QUOTA_PATTERNS: Tuple[str, ...] = (
+    "insufficient_quota",
+    "exceeded your current quota",
+    "credit balance is too low",
+    "insufficient credits",
+    "billing_hard_limit",
+    "spending limit",
+    "requests per day",
+    "limit: 0",
+)
+
+
+def is_quota_limit_error(exc: Union[Exception, str]) -> bool:
+    """Detecta se a exceção corresponde a estouro de cota, créditos ou limite de taxa (429/Quota)."""
+    lower = str(exc).lower()
+    return any(pattern in lower for pattern in QUOTA_ERROR_PATTERNS)
+
+
+def classify_api_error(
+    exc: Exception,
+    provider_id: str = "",
+    using_user_key: bool = False,
+) -> Dict[str, str]:
     """
-    Converte exceções técnicas de APIs de LLM (401, 429, 413, timeout, 503) em mensagens
-    claras em português com orientação prática e sem expor chaves de API.
+    Classifica exceções técnicas de APIs de LLM (`quota`, `auth`, `model_not_found`, `context`,
+    `timeout`, `overloaded`, `unknown`) e produz mensagens claras em português sem expor chaves de API.
     """
     raw = scrub_sensitive_keys(str(exc))
     lower = raw.lower()
-    prov_label = PROVIDER_LABELS.get(provider_id, provider_id or "Provedor de IA")
+    norm_prov = ""
+    if provider_id:
+        try:
+            norm_prov = normalize_provider_key(provider_id)
+        except ValueError:
+            norm_prov = provider_id.strip().lower()
+    prov_label = PROVIDER_LABELS.get(norm_prov, provider_id or "Provedor de IA")
+    usage_url = PROVIDER_USAGE_URLS.get(norm_prov, "")
+    key_origin = "da sua chave de API" if using_user_key else "da API configurada"
 
-    if any(k in lower for k in ("401", "unauthorized", "invalid api key", "invalid_api_key", "api_key_invalid", "invalid token")):
-        return (
-            f"🔑 **Chave de API inválida ou sem permissão ({prov_label} - Erro 401):** "
-            "Verifique se a chave informada na barra lateral está correta e ativa."
+    if any(
+        k in lower
+        for k in (
+            "401",
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "api_key_invalid",
+            "invalid token",
+            "authentication_error",
         )
-    if any(k in lower for k in ("429", "resource_exhausted", "rate limit", "rate_limit", "quota")):
-        return (
-            f"⏳ **Limite de requisições atingido ({prov_label} - Erro 429):** "
-            "A cota por minuto deste modelo foi atingida. Aguarde alguns segundos ou alterne para outro modelo/provedor na barra lateral."
-        )
+    ):
+        return {
+            "category": "auth",
+            "message": (
+                f"🔑 **Chave de API inválida ou sem permissão ({prov_label} — Erro 401):** "
+                "Verifique se a chave informada na barra lateral está correta e ativa."
+            ),
+            "action_hint": "Revise ou substitua sua API Key na barra lateral esquerda.",
+        }
+
+    if is_quota_limit_error(raw):
+        is_hard_quota = any(k in lower for k in HARD_QUOTA_PATTERNS)
+        if is_hard_quota:
+            msg = (
+                f"🚫 **Limite da sua API atingido ({prov_label} — Cota/Créditos Esgotados):** "
+                f"A cota de uso ou saldo disponível {key_origin} foi esgotado."
+            )
+        else:
+            msg = (
+                f"⏳ **Limite da sua API atingido ({prov_label} — Erro 429 / Cota Excedida):** "
+                f"O limite de requisições ou tokens {key_origin} foi atingido neste momento."
+            )
+        usage_hint = f" Consulte seu consumo e limites em {usage_url}." if usage_url else ""
+        return {
+            "category": "quota",
+            "message": msg,
+            "action_hint": (
+                "💡 **O que fazer agora:** Aguarde alguns instantes (se for limite por minuto), "
+                "alterne para um modelo mais leve (ex.: `gemini-2.5-flash-lite` ou `gpt-4o-mini`), "
+                f"ou troque o provedor/chave na barra lateral.{usage_hint}"
+            ),
+        }
+
+    if any(
+        k in lower
+        for k in ("404", "not_found", "not found", "no longer available", "model_not_found", "does not exist")
+    ):
+        return {
+            "category": "model_not_found",
+            "message": (
+                f"🔎 **Modelo indisponível ou descontinuado ({prov_label} — Erro 404):** "
+                "O modelo selecionado não está disponível para esta conta ou versão da API."
+            ),
+            "action_hint": (
+                "Selecione outro modelo ativo na barra lateral (ex.: `gemini-2.5-flash`, "
+                "`gemini-2.5-flash-lite` ou `gpt-4o-mini`)."
+            ),
+        }
+
     if any(k in lower for k in ("413", "context_length", "too many tokens", "maximum context", "token limit")):
-        return (
-            f"📏 **Limite de contexto excedido ({prov_label} - Erro 413):** "
-            "A consulta excedeu a janela deste modelo. Selecione um modelo Recomendado ou clique em 'Limpar Conversa'."
-        )
+        return {
+            "category": "context",
+            "message": (
+                f"📏 **Limite de contexto excedido ({prov_label} — Erro 413):** "
+                "A consulta excedeu a janela deste modelo. Selecione um modelo Recomendado ou clique em 'Limpar Conversa'."
+            ),
+            "action_hint": "",
+        }
+
     if any(k in lower for k in ("timeout", "timed out", "504", "deadline")):
-        return (
-            f"⌛ **Tempo limite esgotado ({prov_label} - Timeout):** "
-            "O provedor demorou muito para responder. Tente novamente ou escolha um modelo rápido (ex: Gemini Flash / GPT-4o-mini)."
-        )
-    if any(k in lower for k in ("503", "unavailable", "overloaded", "high demand", "502")):
-        return (
-            f"🚧 **Serviço temporariamente sobrecarregado ({prov_label} - Erro 503):** "
-            "O provedor está com alta demanda no momento. Tente novamente em instantes."
-        )
-    return f"⚠️ **Não foi possível concluir a geração ({prov_label}):** {raw}"
+        return {
+            "category": "timeout",
+            "message": (
+                f"⌛ **Tempo limite esgotado ({prov_label} — Timeout):** "
+                "O provedor demorou muito para responder. Tente novamente ou escolha um modelo rápido (ex: Gemini Flash / GPT-4o-mini)."
+            ),
+            "action_hint": "",
+        }
+
+    if any(k in lower for k in ("503", "529", "unavailable", "overloaded", "high demand", "502")):
+        return {
+            "category": "overloaded",
+            "message": (
+                f"🚧 **Serviço temporariamente sobrecarregado ({prov_label} — Erro 503):** "
+                "O provedor está com alta demanda no momento. Tente novamente em instantes ou alterne o modelo."
+            ),
+            "action_hint": "",
+        }
+
+    return {
+        "category": "unknown",
+        "message": f"⚠️ **Não foi possível concluir a geração ({prov_label}):** {raw}",
+        "action_hint": "",
+    }
+
+
+def format_friendly_api_error(
+    exc: Exception,
+    provider_id: str = "",
+    using_user_key: bool = False,
+) -> str:
+    """
+    Converte exceções técnicas de APIs de LLM (401, 429/cota, 404, 413, timeout, 503) em mensagens
+    claras em português com orientação prática e sem expor chaves de API.
+    """
+    info = classify_api_error(exc, provider_id=provider_id, using_user_key=using_user_key)
+    if info["action_hint"]:
+        return f"{info['message']}\n\n{info['action_hint']}"
+    return info["message"]
 
 
 def preflight_check_provider(
@@ -778,21 +918,28 @@ class GeminiProvider(BaseLLMProvider):
     ) -> Generator[str, None, None]:
         client = self._get_client()
 
+        # Apenas modelos ativos (gemini-2.0-flash foi oficialmente descontinuado pelo Google)
         fallback_models: List[str] = []
         for candidate in (
             self.model_name,
             "gemini-2.5-flash",
-            "gemini-3-flash-preview",
-            "gemini-3.1-flash-preview",
             "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
+            "gemini-3.8-flash",
         ):
             if candidate and candidate not in fallback_models:
                 fallback_models.append(candidate)
 
+        primary_exc: Optional[Exception] = None
         last_exc: Optional[Exception] = None
-        for candidate_model in fallback_models:
-            for use_thinking_zero in (True, False):
+
+        for idx, candidate_model in enumerate(fallback_models):
+            # Apenas a família gemini-2.5 suporta thinking_budget=0; modelos Gemini 3.x não devem enviar esse parâmetro
+            thinking_attempts = (
+                (True, False)
+                if candidate_model.lower().startswith("gemini-2.5")
+                else (False,)
+            )
+            for use_thinking_zero in thinking_attempts:
                 try:
                     cfg_kwargs: Dict[str, Any] = {
                         "temperature": self.temperature,
@@ -819,17 +966,40 @@ class GeminiProvider(BaseLLMProvider):
                         self.model_name = candidate_model
                         return
                 except Exception as exc:
+                    if idx == 0 and primary_exc is None:
+                        primary_exc = exc
                     last_exc = exc
                     err_lower = str(exc).lower()
-                    if use_thinking_zero and "thinking" in err_lower:
+
+                    # Se a cota/limite da API estourou, interrompe imediatamente para avisar o usuário
+                    if is_quota_limit_error(exc):
+                        raise
+
+                    # Se thinking_budget=0 não for aceito, tenta o mesmo modelo sem thinking_config
+                    if use_thinking_zero and any(
+                        k in err_lower
+                        for k in ("thinking", "budget", "invalid_argument", "400", "not supported")
+                    ):
                         continue
+
+                    # Só faz fallback para outro modelo ativo se o atual estiver indisponível (404/503)
                     if any(
                         code in err_lower
-                        for code in ("404", "not found", "no longer available", "503", "unavailable", "overloaded")
+                        for code in (
+                            "404",
+                            "not found",
+                            "not_found",
+                            "no longer available",
+                            "503",
+                            "unavailable",
+                            "overloaded",
+                        )
                     ):
                         break
                     raise
 
+        if primary_exc is not None:
+            raise primary_exc
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("Não foi possível obter stream de resposta do Google Gemini.")
