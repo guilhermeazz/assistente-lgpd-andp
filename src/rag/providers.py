@@ -6,7 +6,7 @@ Implementa:
 - Detecção automática e rápida de ambiente (Cloud vs. Local) com timeout <= 0.6s.
 - Validação prévia (Preflight Check) e tradução amigável de erros de API sem vazamento de chaves.
 - Streaming real (`generate_stream(messages, **kwargs)` e `stream_generate(system_prompt, user_prompt)`)
-  em todos os provedores: Google Gemini (`google-genai`), OpenAI, Anthropic Claude, Hugging Face GPU (Qwen) e Ollama Local.
+  em todos os provedores: Google Gemini (`google-genai`), OpenAI, Anthropic Claude e Ollama Local.
 """
 
 from __future__ import annotations
@@ -168,29 +168,6 @@ MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
     },
 }
-
-
-def _discover_hf_qwen_models(token: str, base_url: str = DEFAULT_HF_ROUTER_URL) -> List[str]:
-    """Consulta `/v1/models` no Hugging Face Router para localizar modelos Qwen habilitados na conta."""
-    try:
-        resp = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=4.0,
-        )
-        if resp.status_code != 200:
-            return []
-        data = resp.json().get("data", []) or []
-        qwen_ids = [
-            str(item.get("id", "")).strip()
-            for item in data
-            if "qwen" in str(item.get("id", "")).lower()
-            and "embed" not in str(item.get("id", "")).lower()
-            and "vl" not in str(item.get("id", "")).lower()
-        ]
-        return qwen_ids[:4]
-    except Exception:
-        return []
 
 
 def normalize_provider_key(provider_name: str) -> str:
@@ -405,7 +382,7 @@ def detect_runtime_environment(base_url: str = DEFAULT_OLLAMA_URL) -> Dict[str, 
     """
     Detecta o modo de operação (Cloud vs. Local) e define o provedor padrão seguro:
     - Em modo Cloud (ou quando Ollama local está offline): NUNCA escolhe Ollama como padrão;
-      prioriza `gemini` (ou `huggingface` se `HF_TOKEN` estiver configurado e `GEMINI_API_KEY` não).
+      prioriza `gemini` (ou `openai`/`anthropic` caso apenas outra chave em nuvem esteja configurada).
     - Em modo Local (Ollama online e com modelo instalado): habilita todos os provedores.
     """
     status = check_ollama_status(base_url=base_url, timeout=0.5, skip_if_cloud=True)
