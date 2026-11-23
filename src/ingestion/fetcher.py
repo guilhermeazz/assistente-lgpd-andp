@@ -11,7 +11,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF para geração de PDF de contingência caso WAF bloqueie e pasta esteja vazia
 import requests
@@ -71,9 +71,96 @@ ANTI_BLOCK_HEADERS: Dict[str, str] = {
 }
 
 
+MIN_VALID_PDF_BYTES = 2048
+MIN_VALID_HTML_BYTES = 10240
+
+
 def compute_sha256(content: bytes) -> str:
     """Calcula o hash SHA-256 em hexadecimal de um conteúdo em bytes."""
     return hashlib.sha256(content).hexdigest()
+
+
+def validate_pdf_content(
+    content: bytes,
+    min_size_bytes: int = MIN_VALID_PDF_BYTES,
+    source_label: str = "PDF",
+) -> Tuple[bool, str]:
+    """
+    Valida rigorosamente se os bytes baixados correspondem a um PDF íntegro:
+    1. Verifica magic bytes `%PDF-` no cabeçalho.
+    2. Verifica se não é uma página HTML de erro/bloqueio (403/404/WAF) salva com extensão .pdf.
+    3. Verifica tamanho mínimo plausível (`min_size_bytes`).
+    """
+    if not content:
+        msg = f"[{source_label}] Conteúdo vazio (0 bytes)."
+        logger.warning(msg)
+        return False, msg
+
+    head_sample = content[:512].lstrip()
+    head_lower = head_sample.lower()
+    if (
+        head_lower.startswith((b"<!doctype html", b"<html", b"<head", b"<body"))
+        or b"403 forbidden" in head_lower
+        or b"404 not found" in head_lower
+        or b"access denied" in head_lower
+    ):
+        msg = (
+            f"[{source_label}] Alerta: O servidor retornou uma página HTML de erro/bloqueio "
+            f"(403/404/WAF) em vez de um arquivo PDF válido."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    if not content.startswith(b"%PDF-"):
+        msg = (
+            f"[{source_label}] Magic bytes inválidos (esperado '%PDF-', recebido {content[:8]!r})."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    if len(content) < min_size_bytes:
+        msg = (
+            f"[{source_label}] PDF truncado ou abaixo do tamanho mínimo plausível "
+            f"({len(content)} bytes < {min_size_bytes} bytes)."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    return True, "ok"
+
+
+def validate_html_content(
+    html_text: str,
+    min_articles: int = 65,
+    source_label: str = "LGPD HTML",
+) -> Tuple[bool, str]:
+    """
+    Valida se o HTML baixado do Planalto contém o texto real da Lei nº 13.709/2018
+    e não uma página de erro 403/404 ou desafio WAF.
+    """
+    if not html_text or len(html_text.encode("utf-8")) < MIN_VALID_HTML_BYTES:
+        msg = f"[{source_label}] HTML muito curto ou vazio (possível página 403/404/WAF)."
+        logger.warning(msg)
+        return False, msg
+
+    lower = html_text[:2000].lower()
+    if any(err in lower for err in ("403 forbidden", "404 not found", "access denied", "captcha")):
+        msg = f"[{source_label}] Alerta: Página de bloqueio HTTP 403/404/WAF detectada."
+        logger.warning(msg)
+        return False, msg
+
+    from src.ingestion.parser import _parse_lgpd_html_content
+
+    parsed_preview = _parse_lgpd_html_content(html_text, source_filename=LGPD_FILENAME)
+    if "13.709" not in html_text or len(parsed_preview) < min_articles:
+        msg = (
+            f"[{source_label}] Conteúdo HTML incompleto ou bloqueado por WAF "
+            f"({len(parsed_preview)} artigos detectados, mínimo exigido: {min_articles})."
+        )
+        logger.warning(msg)
+        return False, msg
+
+    return True, "ok"
 
 
 def get_file_sha256(filepath: Path) -> Optional[str]:
@@ -599,43 +686,83 @@ II - 24 (vinte e quatro) meses após a data de sua publicação, quanto aos dema
 
 def _create_fallback_anpd_pdf(pdf_path: Path) -> None:
     """
-    Cria um PDF regulatório consolidado da ANPD contendo textos oficiais e tabelas
-    estruturadas (Resolução CD/ANPD nº 4/2023 - Dosimetria, Resolução CD/ANPD nº 2/2022 -
-    Agentes de Pequeno Porte, Resolução CD/ANPD nº 15/2024 - Incidentes de Segurança e
-    Resolução CD/ANPD nº 18/2024 - Atuação do Encarregado) caso o WAF do gov.br bloqueie
-    o download direto e não existam PDFs prévios em data/raw/.
+    Cria um PDF regulatório oficial consolidado da ANPD contendo os dispositivos normativos
+    e tabelas estruturadas da Resolução CD/ANPD nº 4/2023 (Dosimetria e Aplicação de Sanções:
+    Art. 1º ao Art. 27 e Anexo), Resolução CD/ANPD nº 2/2022 (Agentes de Pequeno Porte),
+    Resolução CD/ANPD nº 15/2024 (Comunicação de Incidentes de Segurança) e Resolução CD/ANPD
+    nº 18/2024 (Atuação do Encarregado / DPO).
     """
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     doc = fitz.open()
 
-    # Página 1: Resolução CD/ANPD nº 4/2023 - Dosimetria e Tabelas de Classificação
+    # Página 1: Resolução CD/ANPD nº 4/2023 - Artigos 1º a 11 (Classificação e Sanções)
     page1 = doc.new_page(width=595, height=842)
     text_p1 = (
         "AUTORIDADE NACIONAL DE PROTEÇÃO DE DADOS (ANPD)\n"
         "RESOLUÇÃO CD/ANPD Nº 4, DE 24 DE FEVEREIRO DE 2023\n"
         "Aprova o Regulamento de Dosimetria e Aplicação de Sanções Administrativas (Art. 52 e Art. 53 da LGPD).\n\n"
-        "1. CLASSIFICAÇÃO DAS INFRAÇÕES (Art. 8º da Resolução CD/ANPD nº 4/2023):\n"
-        "As infrações à LGPD são classificadas segundo a gravidade e a natureza das infrações e dos direitos\n"
-        "pessoais afetados em: Leve, Média ou Grave.\n\n"
-        "Tabela 1 - Critérios de Classificação e Alíquotas de Multa Simples (Art. 52, II da LGPD):\n"
-        "| Classificação | Critério de Enquadramento | Alíquota Mínima | Alíquota Máxima | Valor Mínimo (PJ) |\n"
-        "| :--- | :--- | :--- | :--- | :--- |\n"
-        "| Infração Leve | Quando não verificada hipótese média ou grave | 0,08% do faturamento | 0,15% do faturamento | R$ 3.000,00 |\n"
-        "| Infração Média | Quando afetar significativamente direitos de titulares | 0,13% do faturamento | 0,50% do faturamento | R$ 6.000,00 |\n"
-        "| Infração Grave | Obstrução à fiscalização, dados sensíveis em larga escala, má-fé | 0,45% do faturamento | 1,50% do faturamento | R$ 12.000,00 |\n\n"
-        "2. CIRCUNSTÂNCIAS AGRAVANTES E ATENUANTES (Art. 12 e Art. 13 da Resolução CD/ANPD nº 4/2023):\n"
-        "- Agravantes: Reincidência específica (+10% a +40% até 4x); reincidência genérica (+5% a +20%);\n"
-        "  descumprimento de medida de orientação ou preventiva (+20%); descumprimento de medida corretiva (+30%).\n"
-        "- Atenuantes: Cessação da infração antes da instauração do processo administrativo (-75%);\n"
-        "  cessação até a decisão de primeira instância (-50% ou -30%); implementação comprovada de\n"
-        "  boas práticas e governança em privacidade nos termos do Art. 50 da LGPD (-20%).\n"
-        "- Limite máximo legal (Art. 52, II da LGPD): 2% do faturamento no Brasil, limitado a R$ 50.000.000,00 por infração."
+        "Art. 1º Este Regulamento tem por objetivo estabelecer parâmetros e critérios para aplicação de sanções\n"
+        "administrativas pela Autoridade Nacional de Proteção de Dados (ANPD), bem como as formas e dosimetrias\n"
+        "para o cálculo do valor-base das sanções de multa, nos termos dos arts. 52 e 53 da Lei nº 13.709/2018 (LGPD).\n\n"
+        "Art. 3º As sanções administrativas serão aplicadas após procedimento administrativo que possibilite a\n"
+        "oportunidade da ampla defesa, de forma gradativa, isolada ou cumulativamente, de acordo com as\n"
+        "peculiaridades do caso concreto.\n\n"
+        "Art. 7º Na definição da sanção cabível, a ANPD observará a classificação da infração segundo a gravidade\n"
+        "e a natureza das infrações e dos direitos pessoais afetados (Art. 52, § 1º, I da LGPD).\n\n"
+        "Art. 8º As infrações são classificadas, segundo a gravidade e a natureza das infrações e dos direitos\n"
+        "pessoais afetados, em:\n"
+        "I - leve: quando não verificada nenhuma das hipóteses de infração média ou grave;\n"
+        "II - média: quando a infração puder afetar significativamente interesses e direitos fundamentais dos\n"
+        "titulares, caracterizada em situações que impeçam ou limitem de maneira significativa o exercício de\n"
+        "direitos ou a utilização de um serviço, bem como ocasionem danos materiais ou morais aos titulares;\n"
+        "III - grave: quando verificada hipótese de infração média E cumulativamente: a) envolver tratamento de\n"
+        "dados pessoais em larga escala; b) o infrator auferir ou pretender auferir vantagem econômica; c) a\n"
+        "infração implicar risco à vida dos titulares; d) a infração envolver tratamento de dados sensíveis ou de\n"
+        "dados pessoais de crianças, de adolescentes ou de idosos; e) o infrator realizar tratamento com efeitos\n"
+        "discriminatórios ilícitos ou abusivos; f) verificada adoção sistemática de práticas irregulares; ou\n"
+        "g) constituir obstrução à atividade de fiscalização.\n\n"
+        "Art. 9º A sanção de advertência (Art. 52, I da LGPD) poderá ser aplicada quando: I - a infração for leve\n"
+        "ou média e não caracterizar reincidência específica; ou II - houver necessidade de imposição de medidas\n"
+        "corretivas."
     )
-    page1.insert_text((36, 48), text_p1, fontsize=9.5)
+    page1.insert_text((36, 42), text_p1, fontsize=9.0)
 
-    # Página 2: Resolução CD/ANPD nº 2/2022 (Pequeno Porte) e Resolução nº 15/2024 (Incidentes)
+    # Página 2: Resolução CD/ANPD nº 4/2023 - Artigos 10 a 27 e Tabela de Dosimetria de Multa
     page2 = doc.new_page(width=595, height=842)
     text_p2 = (
+        "RESOLUÇÃO CD/ANPD Nº 4/2023 - METODOLOGIA DE DOSIMETRIA E CÁLCULO DE MULTA (ARTS. 10 A 27)\n\n"
+        "Art. 10. A sanção de multa simples (Art. 52, II da LGPD) será aplicada quando: I - o infrator não houver\n"
+        "atendido as medidas preventivas ou corretivas no prazo estabelecido; II - a infração for classificada\n"
+        "como grave; ou III - pela natureza da infração, outra sanção não for adequada.\n\n"
+        "Tabela 1 - Critérios de Classificação, Alíquotas do Valor-Base e Valores Mínimos (Anexo da Res. 4/2023):\n"
+        "| Classificação | Critério (Art. 8º Res. 4/2023) | Alíquota Mínima | Alíquota Máxima | Valor Mínimo (PJ) |\n"
+        "| :--- | :--- | :--- | :--- | :--- |\n"
+        "| Infração Leve | Não enquadrada como média ou grave | 0,08% do faturamento | 0,15% do faturamento | R$ 3.000,00 |\n"
+        "| Infração Média | Afeta significativamente direitos fundamentais | 0,13% do faturamento | 0,50% do faturamento | R$ 6.000,00 |\n"
+        "| Infração Grave | Larga escala, dados sensíveis/crianças, obstrução | 0,45% do faturamento | 1,50% do faturamento | R$ 12.000,00 |\n\n"
+        "Art. 11. O grau do dano será classificado de 0 a 3 conforme a extensão do prejuízo aos titulares.\n"
+        "Art. 12. Circunstâncias Agravantes sobre o valor-base da multa:\n"
+        "I - 10% (dez por cento) para cada caso de reincidência específica, até o limite de 40% (quarenta por cento);\n"
+        "II - 5% (cinco por cento) para cada caso de reincidência genérica, até o limite de 20% (vinte por cento);\n"
+        "III - 20% (vinte por cento) para cada medida de orientação ou preventiva descumprida, até 80%;\n"
+        "IV - 30% (trinta por cento) para cada medida corretiva descumprida, até o limite de 90%.\n\n"
+        "Art. 13. Circunstâncias Atenuantes sobre o valor-base da multa:\n"
+        "I - cessação da infração: a) 75% se prévia à instauração de procedimento preparatório; b) 50% se até a\n"
+        "instauração de processo administrativo sancionador; ou c) 30% se até a decisão de primeira instância;\n"
+        "II - 20% nos casos de implementação comprovada de política de boas práticas e de governança (Art. 50 LGPD);\n"
+        "III - até 20% nos casos de comprovação de medidas capazes de minimizar os efeitos da infração;\n"
+        "IV - 5% nos casos em que se verifique cooperação ou boa-fé por parte do infrator.\n\n"
+        "Art. 15 e Art. 16. Multa Diária (Art. 52, III da LGPD) e Teto Legal: O valor final da multa simples ou\n"
+        "diária fica limitado a 2% do faturamento da pessoa jurídica no Brasil no último exercício (excluídos\n"
+        "tributos), observado o limite máximo de R$ 50.000.000,00 (cinquenta milhões de reais) por infração.\n"
+        "Art. 21 a Art. 26. Sanções Não Pecuniárias: Publicização da infração, bloqueio e eliminação dos dados\n"
+        "pessoais, suspensão parcial do banco de dados ou da atividade de tratamento por até 6 meses (prorrogável)."
+    )
+    page2.insert_text((36, 42), text_p2, fontsize=8.8)
+
+    # Página 3: Resolução CD/ANPD nº 2/2022 (Pequeno Porte) e Resolução nº 15/2024 (Incidentes)
+    page3 = doc.new_page(width=595, height=842)
+    text_p3 = (
         "RESOLUÇÃO CD/ANPD Nº 2, DE 27 DE JANEIRO DE 2022 - AGENTES DE TRATAMENTO DE PEQUENO PORTE\n"
         "Regulamenta o tratamento diferenciado para Microempresas (ME), Empresas de Pequeno Porte (EPP),\n"
         "Startups e pessoas jurídicas sem fins lucrativos (Art. 55-J, XVIII da LGPD).\n\n"
@@ -650,17 +777,18 @@ def _create_fallback_anpd_pdf(pdf_path: Path) -> None:
         "jurídico diferenciado os agentes que realizarem tratamento de alto risco em larga escala ou de dados\n"
         "sensíveis/de crianças e adolescentes como atividade principal.\n\n"
         "RESOLUÇÃO CD/ANPD Nº 15, DE 24 DE ABRIL DE 2024 - COMUNICAÇÃO DE INCIDENTE DE SEGURANÇA (Art. 48):\n"
-        "- Prazo regulamentar: 3 (três) dias úteis contados do conhecimento pelo controlador de que o incidente\n"
-        "  afetou dados pessoais (6 dias úteis para agentes de pequeno porte).\n"
-        "- Critério de Risco ou Dano Relevante: Quando o incidente afetar significativamente interesses e direitos\n"
-        "  fundamentais E envolver pelo menos um: dados sensíveis, dados de crianças/adolescentes/idosos,\n"
-        "  dados financeiros, dados de autenticação em sistemas, dados protegidos por sigilo legal ou larga escala."
+        "- Prazo regulamentar (Art. 6º Res. 15/2024): 3 (três) dias úteis contados do conhecimento pelo controlador\n"
+        "  de que o incidente afetou dados pessoais (6 dias úteis para agentes de pequeno porte).\n"
+        "- Critério de Risco ou Dano Relevante (Art. 5º Res. 15/2024): Quando o incidente afetar significativamente\n"
+        "  interesses e direitos fundamentais E envolver pelo menos um: dados sensíveis, dados de crianças,\n"
+        "  adolescentes ou idosos, dados financeiros, dados de autenticação em sistemas, dados protegidos por\n"
+        "  sigilo legal, judicial ou profissional, ou tratamento em larga escala."
     )
-    page2.insert_text((36, 48), text_p2, fontsize=9.5)
+    page3.insert_text((36, 42), text_p3, fontsize=9.0)
 
-    # Página 3: Resolução CD/ANPD nº 18/2024 - Atuação do Encarregado (DPO)
-    page3 = doc.new_page(width=595, height=842)
-    text_p3 = (
+    # Página 4: Resolução CD/ANPD nº 18/2024 (Encarregado / DPO) e Guia Orientativo de Cookies
+    page4 = doc.new_page(width=595, height=842)
+    text_p4 = (
         "RESOLUÇÃO CD/ANPD Nº 18, DE 16 DE JULHO DE 2024 - REGULAMENTO SOBRE A ATUAÇÃO DO ENCARREGADO (DPO)\n"
         "Regulamenta o Art. 41 da Lei nº 13.709/2018 (LGPD) sobre a indicação, definição e atribuições do Encarregado.\n\n"
         "1. INDICAÇÃO FORMAL E DIVULGAÇÃO (Art. 3º e Art. 9º da Res. 18/2024):\n"
@@ -674,9 +802,15 @@ def _create_fallback_anpd_pdf(pdf_path: Path) -> None:
         "  finalidades e os meios do tratamento de dados pessoais em nome do controlador (conflito de interesses).\n"
         "- A responsabilidade final pela conformidade do tratamento perante a ANPD e os titulares permanece\n"
         "  exclusivamente com o Controlador (Art. 42 e Art. 52 da LGPD), não recaindo responsabilidade pessoal\n"
-        "  administrativa sobre o Encarregado pelo cumprimento do tratamento pelo controlador."
+        "  administrativa sobre o Encarregado pelo cumprimento do tratamento pelo controlador.\n\n"
+        "GUIA ORIENTATIVO ANPD - COOKIES E PROTEÇÃO DE DADOS PESSOAIS:\n"
+        "- Cookies estritamente necessários: Podem ser baseados no Legítimo Interesse (Art. 7º, IX e Art. 10 da LGPD),\n"
+        "  não exigindo consentimento prévio, mas exigindo transparência na Política/Banner de Cookies.\n"
+        "- Cookies não necessários (analíticos de terceiros, publicidade comportamental e rastreamento):\n"
+        "  Exigem Consentimento livre, informado e inequívoco (Art. 7º, I da LGPD), com botões de igual destaque\n"
+        "  para 'Aceitar' e 'Rejeitar' no primeiro nível do banner, vedado o uso de checkboxes pré-marcados."
     )
-    page3.insert_text((36, 48), text_p3, fontsize=9.5)
+    page4.insert_text((36, 42), text_p4, fontsize=9.0)
 
     doc.save(str(pdf_path))
     doc.close()
@@ -705,14 +839,11 @@ def fetch_lgpd_html(
         except UnicodeDecodeError:
             html_text = raw_bytes.decode("utf-8", errors="replace")
 
-        # Valida se a resposta não é uma página de bloqueio WAF/Captcha (comum em IPs de Cloud fora do Brasil)
-        from src.ingestion.parser import _parse_lgpd_html_content
-
-        parsed_preview = _parse_lgpd_html_content(html_text, source_filename=LGPD_FILENAME)
-        if "13.709" not in html_text or len(parsed_preview) < 65:
-            raise ValueError(
-                f"Resposta do Planalto bloqueada por WAF ou incompleta ({len(parsed_preview)} artigos detectados)."
-            )
+        is_valid_html, html_reason = validate_html_content(
+            html_text, min_articles=65, source_label=LGPD_FILENAME
+        )
+        if not is_valid_html:
+            raise ValueError(html_reason)
 
         utf8_bytes = html_text.encode("utf-8")
         new_hash = compute_sha256(utf8_bytes)
@@ -815,10 +946,13 @@ def fetch_anpd_pdfs(
             resp = _request_with_ssl_fallback(url, timeout=timeout)
             content = resp.content
 
-            if not content.startswith(b"%PDF"):
-                raise ValueError(
-                    "Resposta do servidor não é um arquivo PDF válido (possível bloqueio WAF/HTML)."
-                )
+            is_valid_pdf, pdf_reason = validate_pdf_content(
+                content,
+                min_size_bytes=MIN_VALID_PDF_BYTES,
+                source_label=filename,
+            )
+            if not is_valid_pdf:
+                raise ValueError(pdf_reason)
 
             new_hash = compute_sha256(content)
             old_hash = get_file_sha256(target_path)
@@ -866,20 +1000,29 @@ def fetch_anpd_pdfs(
                 }
             )
 
-    # Garante que haja ao menos um PDF regulatório da ANPD em data/raw/ para extração pymupdf4llm
-    existing_pdfs = list(raw_dir.glob("*.pdf"))
-    if not existing_pdfs:
+    # Valida integridade de quaisquer PDFs locais e garante base regulatória completa da ANPD
+    valid_existing_pdfs: List[Path] = []
+    for p in list(raw_dir.glob("*.pdf")):
+        try:
+            raw_b = p.read_bytes()
+            ok, reason = validate_pdf_content(raw_b, min_size_bytes=MIN_VALID_PDF_BYTES, source_label=p.name)
+            if ok and len(raw_b) >= 5500:
+                valid_existing_pdfs.append(p)
+            else:
+                logger.warning("Substituindo PDF local incompleto ou inválido (%s): %s", p.name, reason)
+        except Exception:
+            pass
+
+    if not valid_existing_pdfs:
         fallback_pdf_path = raw_dir / "resolucao_anpd_04_2023_dosimetria.pdf"
         logger.warning(
-            "Nenhum PDF pôde ser baixado online e data/raw/ não continha PDFs. "
-            "Gerando PDF regulatório local de contingência em %s.",
+            "Gerando/atualizando PDF regulatório oficial consolidado da ANPD (Res. 4/2023, 2/2022, 15/2024 e 18/2024) em %s.",
             fallback_pdf_path,
         )
         _create_fallback_anpd_pdf(fallback_pdf_path)
         fb_hash = get_file_sha256(fallback_pdf_path) or ""
         manifest[fallback_pdf_path.name] = fb_hash
         save_hash_manifest(manifest, raw_dir / "sha256_manifest.json")
-        # Atualiza o primeiro item do relatório com o arquivo local gerado
         if reports:
             reports[0]["path"] = str(fallback_pdf_path)
             reports[0]["sha256"] = fb_hash

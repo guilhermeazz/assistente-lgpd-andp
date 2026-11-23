@@ -62,7 +62,20 @@ CONCEPT_LABELS_MAP: Dict[str, str] = {
     r"\b(cpf|rg|cnh|endereço|telefone|celular|email|e-mail)\b": "Dado Pessoal Identificável (Art. 5º, I)",
 }
 
-_ANCHOR_ARTICLE_REGEX = re.compile(r"\bArt\.\s*(\d+(?:-[A-Z])?(?:º)?)", re.IGNORECASE)
+_ANCHOR_ARTICLE_REGEX = re.compile(
+    r"\b(?:art(?:igo|s)?\.?)\s*(\d{1,2})\s*(?:º|°|o)?(?:-([A-Za-z]))?\b",
+    re.IGNORECASE,
+)
+
+
+def extract_direct_article_references(query: str) -> List[str]:
+    """
+    Fast-Path Determinístico por Regex (Fase 5.5):
+    Identifica menções explícitas a artigos da LGPD na pergunta do usuário
+    (ex: 'Art. 18', 'artigo 7º', 'Art. 48 da LGPD', 'Art. 55-J') e retorna
+    os identificadores canônicos ('Art. 18', 'Art. 7º', 'Art. 48', 'Art. 55-J').
+    """
+    return extract_anchor_articles(query)
 
 
 def expand_legal_query(query: str) -> Tuple[str, List[str]]:
@@ -99,17 +112,19 @@ def expand_legal_query(query: str) -> Tuple[str, List[str]]:
 
 
 def extract_anchor_articles(text: str) -> List[str]:
-    """Extrai identificadores canônicos de artigos (ex: 'Art. 11', 'Art. 5º') presentes na query expandida."""
+    """Extrai identificadores canônicos de artigos (ex: 'Art. 11', 'Art. 5º') presentes no texto."""
     found: List[str] = []
     for match in _ANCHOR_ARTICLE_REGEX.finditer(text or ""):
-        raw_num = match.group(1).strip()
+        num_str = match.group(1).strip()
+        suffix = (match.group(2) or "").strip().upper()
         try:
-            base_num = int(re.match(r"^\d+", raw_num).group(0))  # type: ignore[union-attr]
-            if 1 <= base_num <= 9 and "-" not in raw_num and not raw_num.endswith("º"):
-                raw_num = f"{raw_num}º"
+            num_val = int(num_str)
+            if not (1 <= num_val <= 65):
+                continue
+            base = f"Art. {num_val}º" if 1 <= num_val <= 9 else f"Art. {num_val}"
+            canonical = f"{base}-{suffix}" if suffix else base
+            if canonical not in found:
+                found.append(canonical)
         except Exception:
-            pass
-        canonical = f"Art. {raw_num}"
-        if canonical not in found:
-            found.append(canonical)
+            continue
     return found
