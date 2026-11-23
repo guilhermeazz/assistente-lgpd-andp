@@ -170,6 +170,29 @@ MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
 }
 
 
+def _discover_hf_qwen_models(token: str, base_url: str = DEFAULT_HF_ROUTER_URL) -> List[str]:
+    """Consulta `/v1/models` no Hugging Face Router para localizar modelos Qwen habilitados na conta."""
+    try:
+        resp = requests.get(
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=4.0,
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json().get("data", []) or []
+        qwen_ids = [
+            str(item.get("id", "")).strip()
+            for item in data
+            if "qwen" in str(item.get("id", "")).lower()
+            and "embed" not in str(item.get("id", "")).lower()
+            and "vl" not in str(item.get("id", "")).lower()
+        ]
+        return qwen_ids[:4]
+    except Exception:
+        return []
+
+
 def normalize_provider_key(provider_name: str) -> str:
     """Normaliza o identificador ou rótulo da UI para a chave canônica do provedor."""
     cleaned = (provider_name or "gemini").strip().lower()
