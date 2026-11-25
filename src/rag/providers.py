@@ -261,22 +261,52 @@ def _read_secret_or_env(*keys: str) -> Optional[str]:
     return None
 
 
+def sanitize_api_key(raw_key: Optional[str]) -> str:
+    """
+    Higieniza o campo de API Key:
+    - Remove espaços invisíveis Unicode (zero-width, non-breaking space) e aspas ao redor.
+    - Caso o usuário tenha colado uma linha inteira (ex.: `GEMINI_API_KEY="AIzaSy..."` ou texto ao redor da chave),
+      extrai automaticamente apenas o token ASCII da chave (`AIza...` ou `sk-...`).
+    """
+    if not raw_key:
+        return ""
+    cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff\xa0]+", " ", str(raw_key)).strip().strip("\"'`")
+    token_match = re.search(r"(AIza[0-9A-Za-z\-_]{20,}|sk-[0-9A-Za-z\-_]{15,})", cleaned)
+    if token_match:
+        return token_match.group(1)
+    return cleaned.strip()
+
+
+def is_valid_ascii_api_key(key: Optional[str]) -> bool:
+    """
+    Verifica se a string é uma chave de API ASCII válida para cabeçalhos HTTP (`httpx`),
+    rejeitando textos com acentos (`ç`, `ã`, etc.) ou espaços colados por engano no input de senha.
+    """
+    if not key:
+        return False
+    return key.isascii() and not any(ch.isspace() for ch in key) and len(key) >= 8
+
+
 def get_provider_api_key(provider_id: str, user_api_key: Optional[str] = None) -> Optional[str]:
     """
     Resolve a API key de um provedor priorizando a chave BYOK informada pelo usuário na sessão
-    e fazendo fallback para `st.secrets` / variáveis de ambiente (modo demonstração no deploy).
+    (após higienização) e fazendo fallback para `st.secrets` / variáveis de ambiente.
     """
-    if user_api_key and user_api_key.strip():
-        return user_api_key.strip()
+    cleaned_user = sanitize_api_key(user_api_key)
+    if cleaned_user:
+        return cleaned_user
 
     key = normalize_provider_key(provider_id)
+    raw_env_key: Optional[str] = None
     if key == "gemini":
-        return _read_secret_or_env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    if key == "openai":
-        return _read_secret_or_env("OPENAI_API_KEY")
-    if key == "anthropic":
-        return _read_secret_or_env("ANTHROPIC_API_KEY")
-    return None
+        raw_env_key = _read_secret_or_env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    elif key == "openai":
+        raw_env_key = _read_secret_or_env("OPENAI_API_KEY")
+    elif key == "anthropic":
+        raw_env_key = _read_secret_or_env("ANTHROPIC_API_KEY")
+
+    cleaned_env = sanitize_api_key(raw_env_key)
+    return cleaned_env or None
 
 
 def is_cloud_environment() -> bool:
@@ -510,6 +540,29 @@ def classify_api_error(
     if any(
         k in lower
         for k in (
+            "codec can't encode character",
+            "ordinal not in range(128)",
+            "unicodeencodeerror",
+            "caracteres inválidos",
+            "acentos ou espaços",
+        )
+    ):
+        return {
+            "category": "auth",
+            "message": (
+                f"🔑 **Texto inválido no campo de API Key ({prov_label}):** "
+                "O campo **🔑 API Key** na barra lateral contém acentos (como `ç`) ou frases em português "
+                "coladas por engano no lugar da chave."
+            ),
+            "action_hint": (
+                "Apague completamente o conteúdo do campo **🔑 API Key** na barra lateral esquerda e "
+                "cole apenas sua chave real (ex.: `AIzaSy...`, `sk-...` ou `sk-ant-...`)."
+            ),
+        }
+
+    if any(
+        k in lower
+        for k in (
             "401",
             "unauthorized",
             "invalid api key",
@@ -676,6 +729,14 @@ def preflight_check_provider(
         return (
             False,
             f"🔑 **Chave de API necessária:** Insira sua API Key para **{PROVIDER_LABELS[key]}** na barra lateral esquerda para habilitar o chat.",
+        )
+
+    if not is_valid_ascii_api_key(resolved_key):
+        return (
+            False,
+            f"🔑 **Chave de API inválida para {PROVIDER_LABELS[key]}:** O campo **🔑 API Key** na barra lateral "
+            "contém acentos, espaços ou texto colado por engano (ex.: mensagem em português). "
+            "Limpe o campo de senha e cole apenas sua chave de API (`AIzaSy...` / `sk-...`).",
         )
 
     return True, "ok"
@@ -918,6 +979,11 @@ class GeminiProvider(BaseLLMProvider):
         if not key:
             raise ValueError(
                 "API Key do Google Gemini não informada. Insira sua chave na barra lateral (BYOK)."
+            )
+        if not is_valid_ascii_api_key(key):
+            raise ValueError(
+                "A API Key informada contém caracteres inválidos (acentos ou espaços colados por engano). "
+                "Limpe o campo de API Key na barra lateral e cole apenas sua chave AIzaSy..."
             )
         cached = _GEMINI_CLIENT_CACHE.get(key)
         if cached is None:

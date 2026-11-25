@@ -466,3 +466,20 @@ def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
     )
     assert "Erro 404" in err_404
     assert "no longer available" not in err_404
+
+    # 6. Verifica proteção contra texto com acentos ('Serviço...') colado por engano no campo de API Key
+    ok_bad_key, msg_bad_key = preflight_check_provider(
+        "gemini",
+        "gemini-3.8-flash",
+        api_key="Serviço temporariamente sobrecarregado",
+    )
+    assert not ok_bad_key
+    assert "acentos" in msg_bad_key
+
+    ascii_err_info = classify_api_error(
+        UnicodeEncodeError("ascii", "Serviço", 5, 6, "ordinal not in range(128)"),
+        provider_id="gemini",
+        using_user_key=True,
+    )
+    assert ascii_err_info["category"] == "auth"
+    assert "acentos" in ascii_err_info["message"]
