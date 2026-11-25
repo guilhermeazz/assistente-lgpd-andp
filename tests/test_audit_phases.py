@@ -352,12 +352,13 @@ def test_phase7_architecture_pipeline_and_c4_level3_diagram() -> None:
 
 def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
     """
-    Valida a correção do Gemini 3.8 + remoção do gemini-2.0-flash descontinuado + alertas de cota/limite de API:
-    - `gemini-2.0-flash` não existe mais no catálogo nem nos fallbacks do GeminiProvider.
-    - `GeminiProvider(model_name="gemini-3.8-flash")` não envia `thinking_budget=0` incompatível
-      e nunca tenta `gemini-2.0-flash` em caso de erro.
+    Valida a correção do Gemini 3.8 (baixa latência com thinking_level=MINIMAL) + remoção dos modelos 2.x da UI + alertas de cota:
+    - Apenas `gemini-3.8-flash` fica visível no seletor da UI do Gemini (modelos 2.0 e 2.5 não aparecem no seletor).
+    - `GeminiProvider(model_name="gemini-3.8-flash")` envia `thinking_level="MINIMAL"` e `include_thoughts=False` para baixa latência.
+    - Se `gemini-2.5-flash` for passado por código legado, é redirecionado automaticamente para `gemini-3.8-flash` sem chamadas 404.
+    - Picos momentâneos `503 Service Unavailable` no `gemini-3.8-flash` fazem retry automático.
     - Erros de estouro de cota/limite (429 / RESOURCE_EXHAUSTED / insufficient_quota / credit balance)
-      interrompem imediatamente o fallback e são classificados como `quota` com orientação clara.
+      interrompem imediatamente e são classificados como `quota` com orientação clara.
     """
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -370,43 +371,57 @@ def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
     )
 
     assert "gemini-2.0-flash" not in MODEL_CATALOG["gemini"]
-    assert "gemini-2.0-flash" not in get_selectable_models("gemini")
-    assert "gemini-3.8-flash" in get_selectable_models("gemini")
-    assert "gemini-2.5-flash-lite" in get_selectable_models("gemini")
+    assert get_selectable_models("gemini") == ["gemini-3.8-flash"]
 
-    # 1. Gemini 3.8 Flash deve chamar generate_content_stream SEM thinking_config=thinking_budget(0)
+    # 1. Gemini 3.8 Flash deve chamar generate_content_stream com thinking_level=MINIMAL e include_thoughts=False
     captured_calls = []
 
     class _FakeModelsOK:
         def generate_content_stream(self, model, contents, config):
-            captured_calls.append((model, getattr(config, "thinking_config", None)))
-            return iter([SimpleNamespace(text="Resposta via "), SimpleNamespace(text="Gemini 3.8.")])
+            t_cfg = getattr(config, "thinking_config", None)
+            t_level = getattr(t_cfg, "thinking_level", None)
+            t_level_str = getattr(t_level, "value", str(t_level)) if t_level is not None else None
+            captured_calls.append((model, t_level_str, getattr(t_cfg, "include_thoughts", None)))
+            return iter([SimpleNamespace(text="Resposta rápida via "), SimpleNamespace(text="Gemini 3.8.")])
 
     fake_client_ok = SimpleNamespace(models=_FakeModelsOK())
     prov_ok = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
     with patch.object(prov_ok, "_get_client", return_value=fake_client_ok):
         out = "".join(prov_ok.stream_generate("sys", "user"))
-    assert out == "Resposta via Gemini 3.8."
-    assert captured_calls == [("gemini-3.8-flash", None)]
+    assert out == "Resposta rápida via Gemini 3.8."
+    assert captured_calls == [("gemini-3.8-flash", "MINIMAL", False)]
 
-    # 2. Se gemini-3.8-flash retornar 404, nunca deve chamar o descontinuado gemini-2.0-flash
+    # 2. Se gemini-2.5-flash legado for instanciado, redireciona direto para gemini-3.8-flash sem erro 404
     attempted_models = []
 
-    class _FakeModels404:
+    class _FakeModelsRedirect:
         def generate_content_stream(self, model, contents, config):
             attempted_models.append(model)
-            if model == "gemini-3.8-flash":
-                raise RuntimeError("404 NOT_FOUND: model unavailable in region")
-            return iter([SimpleNamespace(text="Fallback ativo funcionando.")])
+            return iter([SimpleNamespace(text="Redirecionado para 3.8 com sucesso.")])
 
-    prov_fb = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
-    with patch.object(prov_fb, "_get_client", return_value=SimpleNamespace(models=_FakeModels404())):
-        out_fb = "".join(prov_fb.stream_generate("sys", "user"))
-    assert out_fb == "Fallback ativo funcionando."
-    assert "gemini-2.0-flash" not in attempted_models
-    assert attempted_models == ["gemini-3.8-flash", "gemini-2.5-flash"]
+    prov_legacy = GeminiProvider(model_name="gemini-2.5-flash", api_key="AIzaFakeKeyForTest1234567890")
+    with patch.object(prov_legacy, "_get_client", return_value=SimpleNamespace(models=_FakeModelsRedirect())):
+        out_legacy = "".join(prov_legacy.stream_generate("sys", "user"))
+    assert out_legacy == "Redirecionado para 3.8 com sucesso."
+    assert attempted_models == ["gemini-3.8-flash"]
 
-    # 3. Se estourar o limite da API (429 / RESOURCE_EXHAUSTED), deve interromper imediatamente sem mascarar com 404
+    # 3. Se ocorrer erro 503 temporário (overloaded), faz retry rápido e recupera na 2ª tentativa
+    attempts_503 = []
+
+    class _FakeModels503:
+        def generate_content_stream(self, model, contents, config):
+            attempts_503.append(model)
+            if len(attempts_503) == 1:
+                raise RuntimeError("503 UNAVAILABLE: The model is overloaded. Please try again later.")
+            return iter([SimpleNamespace(text="Recuperado após 503.")])
+
+    prov_503 = GeminiProvider(model_name="gemini-3.8-flash", api_key="AIzaFakeKeyForTest1234567890")
+    with patch.object(prov_503, "_get_client", return_value=SimpleNamespace(models=_FakeModels503())):
+        out_503 = "".join(prov_503.stream_generate("sys", "user"))
+    assert out_503 == "Recuperado após 503."
+    assert len(attempts_503) == 2
+
+    # 4. Se estourar o limite da API (429 / RESOURCE_EXHAUSTED), interrompe imediatamente sem retry desnecessário
     quota_attempts = []
 
     class _FakeModels429:
@@ -428,7 +443,7 @@ def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
             assert "aistudio.google.com/usage" in info["action_hint"]
     assert quota_attempts == ["gemini-3.8-flash"]
 
-    # 4. Verifica detecção de estouro de cota para OpenAI e Anthropic + erro 404 amigável
+    # 5. Verifica detecção de estouro de cota para OpenAI e Anthropic + erro 404 amigável
     oai_info = classify_api_error(
         RuntimeError("Error code: 429 - insufficient_quota: You exceeded your current quota"),
         provider_id="openai",

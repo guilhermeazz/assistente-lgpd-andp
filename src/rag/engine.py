@@ -497,7 +497,13 @@ class LGPDRagEngine:
         api_key: Optional[str] = None,
         base_url: str = DEFAULT_OLLAMA_URL,
     ) -> str:
-        """Reescrita condicional de query (apenas se houver histórico e pronomes referenciais)."""
+        """
+        Contextualização determinística ultra-rápida (~0 ms, sem chamada extra de LLM):
+        Quando a pergunta é curta ou contém pronomes referenciais ambíguos e há histórico,
+        anexa os artigos e termos-chave do último turno para preservar o contexto na busca
+        híbrida sem adicionar segundos de latência nem gastar a cota de RPM da API do usuário.
+        """
+        _ = (provider, provider_name, model_name, api_key, base_url)
         if not chat_history or not self._needs_query_rewrite(query):
             return query.strip()
 
@@ -505,34 +511,13 @@ class LGPDRagEngine:
         if not recent_turns:
             return query.strip()
 
-        history_compact = " | ".join(
-            f"{'U' if m['role'] == 'user' else 'A'}: {m['content']}"
-            for m in recent_turns
+        prior_user_msgs = [m["content"] for m in recent_turns if m.get("role") == "user"]
+        context_anchor = prior_user_msgs[-1] if prior_user_msgs else recent_turns[-1]["content"]
+        prior_articles = extract_direct_article_references(
+            " ".join(m.get("content", "") for m in recent_turns)
         )
-
-        short_system = (
-            "Reescreva a pergunta do usuário tornando-a autossuficiente sobre LGPD/ANPD, "
-            "substituindo pronomes pelo tema do histórico. Retorne APENAS a pergunta curta."
-        )
-        short_user = f"Histórico: {history_compact}\nPergunta: {query}\nReescrita:"
-
-        try:
-            active_provider = provider or get_llm_provider(
-                provider_id=provider_name,
-                model_id=model_name,
-                api_key=api_key or self.api_key,
-                base_url=base_url,
-                temperature=DEFAULT_TEMPERATURE,
-            )
-            rewritten = active_provider.generate(
-                system_prompt=short_system,
-                user_prompt=short_user,
-                max_tokens=40,
-            ).strip()
-            return rewritten if rewritten else query.strip()
-        except Exception as exc:
-            logger.warning("Reescrita condicional ignorada (mantendo query original): %s", exc)
-            return query.strip()
+        articles_str = f" ({' '.join(prior_articles)})" if prior_articles else ""
+        return f"{query.strip()} [Contexto: {context_anchor[:120]}{articles_str}]".strip()
 
     def _rerank_candidates_stage2(
         self,
@@ -1088,7 +1073,8 @@ class LGPDRagEngine:
             t_gen_start = time.perf_counter()
             first_token_received = False
             collected: List[str] = []
-            for token_chunk in active_provider.generate_stream(messages):
+            max_out_tokens = 750 if tier == "recommended" else 500
+            for token_chunk in active_provider.generate_stream(messages, max_tokens=max_out_tokens):
                 if not first_token_received and token_chunk:
                     first_token_received = True
                     ttft_val = round((time.perf_counter() - t_gen_start) * 1000, 1)

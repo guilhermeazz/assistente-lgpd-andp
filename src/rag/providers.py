@@ -80,25 +80,32 @@ TIER_DEFAULTS: Dict[str, Dict[str, Any]] = {
 # Catálogo completo de modelos por provedor com metadados explícitos (Fase 3)
 MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     "gemini": {
-        "gemini-2.5-flash": {
-            **TIER_DEFAULTS["recommended"],
-            "label": "Gemini 2.5 Flash (Recomendado)",
-            "context_window": 1000000,
-        },
         "gemini-3.8-flash": {
             **TIER_DEFAULTS["recommended"],
-            "label": "Gemini 3.8 Flash (Recomendado)",
+            "label": "Gemini 3.8 Flash (Recomendado / Baixa Latência)",
             "context_window": 1000000,
+            "selectable": True,
+        },
+        # Mantidos no catálogo apenas para retrocompatibilidade de metadados/testes (ocultos na UI pois retornam 404/503 na API atual)
+        "gemini-2.5-flash": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Gemini 2.5 Flash (Legado -> Redirecionado para 3.8 Flash)",
+            "context_window": 1000000,
+            "selectable": False,
+            "legacy_alias_for": "gemini-3.8-flash",
         },
         "gemini-2.5-flash-lite": {
             **TIER_DEFAULTS["economic"],
-            "label": "Gemini 2.5 Flash-Lite (Econômico / Ultra-Rápido)",
+            "label": "Gemini 2.5 Flash-Lite (Legado -> Redirecionado para 3.8 Flash)",
             "context_window": 1000000,
+            "selectable": False,
+            "legacy_alias_for": "gemini-3.8-flash",
         },
         "gemini-nano-legacy": {
             **TIER_DEFAULTS["unsupported"],
             "label": "Gemini Nano Legacy (Não Suportado)",
             "context_window": 2048,
+            "selectable": False,
         },
     },
     "openai": {
@@ -187,13 +194,13 @@ def normalize_provider_key(provider_name: str) -> str:
 
 
 def get_selectable_models(provider_id: str, include_unsupported: bool = False) -> List[str]:
-    """Retorna apenas os modelos suportados (`recommended` e `economic`) de um provedor."""
+    """Retorna apenas os modelos ativos e selecionáveis (`recommended` e `economic`) de um provedor."""
     key = normalize_provider_key(provider_id)
     catalog = MODEL_CATALOG.get(key, {})
     return [
         m_id
         for m_id, meta in catalog.items()
-        if include_unsupported or meta.get("tier") != "unsupported"
+        if (include_unsupported or (meta.get("tier") != "unsupported" and meta.get("selectable", True)))
     ]
 
 
@@ -203,7 +210,7 @@ ANTHROPIC_MODELS: List[str] = get_selectable_models("anthropic")
 OLLAMA_MODELS: List[str] = get_selectable_models("ollama")
 
 PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.8-flash",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-3-5-haiku-latest",
     "ollama": "qwen2.5:7b",
@@ -539,8 +546,8 @@ def classify_api_error(
             "message": msg,
             "action_hint": (
                 "💡 **O que fazer agora:** Aguarde alguns instantes (se for limite por minuto), "
-                "alterne para um modelo mais leve (ex.: `gemini-2.5-flash-lite` ou `gpt-4o-mini`), "
-                f"ou troque o provedor/chave na barra lateral.{usage_hint}"
+                "ou troque o provedor/chave na barra lateral (ex.: `gemini-3.8-flash` ou `gpt-4o-mini`)."
+                f"{usage_hint}"
             ),
         }
 
@@ -555,8 +562,8 @@ def classify_api_error(
                 "O modelo selecionado não está disponível para esta conta ou versão da API."
             ),
             "action_hint": (
-                "Selecione outro modelo ativo na barra lateral (ex.: `gemini-2.5-flash`, "
-                "`gemini-2.5-flash-lite` ou `gpt-4o-mini`)."
+                "Selecione o modelo ativo na barra lateral (`gemini-3.8-flash`, "
+                "`gpt-4o-mini` ou `claude-3-5-haiku-latest`)."
             ),
         }
 
@@ -881,23 +888,27 @@ class OllamaProvider(BaseLLMProvider):
         raise RuntimeError("Biblioteca `ollama` ou `openai` não instalada.")
 
 
+_GEMINI_CLIENT_CACHE: Dict[str, genai.Client] = {}
+
+
 class GeminiProvider(BaseLLMProvider):
     """
     Provedor Google Gemini (BYOK / Secrets) utilizando EXCLUSIVAMENTE o SDK oficial `google-genai`
-    e `client.models.generate_content_stream`.
+    e `client.models.generate_content_stream`, otimizado para baixa latência com `gemini-3.8-flash`
+    (`thinking_level="MINIMAL"`, reutilização de conexão HTTP e redirecionamento automático de modelos 2.x legados).
     """
 
     provider_key = "gemini"
 
     def __init__(
         self,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.8-flash",
         api_key: Optional[str] = None,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> None:
         resolved_key = get_provider_api_key("gemini", user_api_key=api_key)
         super().__init__(
-            model_name=model_name or "gemini-2.5-flash",
+            model_name=model_name or "gemini-3.8-flash",
             temperature=temperature,
             api_key=resolved_key,
         )
@@ -908,7 +919,35 @@ class GeminiProvider(BaseLLMProvider):
             raise ValueError(
                 "API Key do Google Gemini não informada. Insira sua chave na barra lateral (BYOK)."
             )
-        return genai.Client(api_key=key)
+        cached = _GEMINI_CLIENT_CACHE.get(key)
+        if cached is None:
+            cached = genai.Client(api_key=key)
+            _GEMINI_CLIENT_CACHE[key] = cached
+        return cached
+
+    @staticmethod
+    def _build_thinking_configs(candidate_model: str) -> List[Optional[types.ThinkingConfig]]:
+        """
+        Retorna a sequência de ThinkingConfig para minimizar drasticamente a latência (TTFT):
+        - Para `gemini-3*` / `gemini-4*` (ex.: `gemini-3.8-flash`): usa `thinking_level="MINIMAL"`
+          (evitando o modo padrão HIGH que leva 8-15s pensando antes do 1º token), com fallback para `"LOW"` e `None`.
+        - Para outros modelos: `None`.
+        """
+        lower_m = candidate_model.lower()
+        configs: List[Optional[types.ThinkingConfig]] = []
+        if lower_m.startswith(("gemini-3", "gemini-4")):
+            for level in ("MINIMAL", "LOW"):
+                try:
+                    configs.append(
+                        types.ThinkingConfig(
+                            thinking_level=level,  # type: ignore[arg-type]
+                            include_thoughts=False,
+                        )
+                    )
+                except Exception:
+                    pass
+        configs.append(None)
+        return configs
 
     def stream_generate(
         self,
@@ -916,16 +955,19 @@ class GeminiProvider(BaseLLMProvider):
         user_prompt: str,
         max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
+        import time as _time
+
         client = self._get_client()
 
-        # Apenas modelos ativos (gemini-2.0-flash foi oficialmente descontinuado pelo Google)
+        # Redireciona automaticamente qualquer modelo 2.x legado/descontinuado para gemini-3.8-flash
+        requested = (self.model_name or "gemini-3.8-flash").strip()
+        if requested.lower().startswith("gemini-2."):
+            active_target = "gemini-3.8-flash"
+        else:
+            active_target = requested
+
         fallback_models: List[str] = []
-        for candidate in (
-            self.model_name,
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-3.8-flash",
-        ):
+        for candidate in (active_target, "gemini-3.8-flash"):
             if candidate and candidate not in fallback_models:
                 fallback_models.append(candidate)
 
@@ -933,70 +975,83 @@ class GeminiProvider(BaseLLMProvider):
         last_exc: Optional[Exception] = None
 
         for idx, candidate_model in enumerate(fallback_models):
-            # Apenas a família gemini-2.5 suporta thinking_budget=0; modelos Gemini 3.x não devem enviar esse parâmetro
-            thinking_attempts = (
-                (True, False)
-                if candidate_model.lower().startswith("gemini-2.5")
-                else (False,)
-            )
-            for use_thinking_zero in thinking_attempts:
-                try:
-                    cfg_kwargs: Dict[str, Any] = {
-                        "temperature": self.temperature,
-                        "system_instruction": system_prompt,
-                    }
-                    if max_tokens is not None:
-                        cfg_kwargs["max_output_tokens"] = int(max_tokens)
-                    if use_thinking_zero:
-                        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            thinking_configs = self._build_thinking_configs(candidate_model)
+            for t_cfg in thinking_configs:
+                # Até 2 tentativas rápidas no mesmo modelo caso ocorra pico momentâneo 503 (overloaded)
+                for attempt_503 in range(2):
+                    try:
+                        cfg_kwargs: Dict[str, Any] = {
+                            "temperature": self.temperature,
+                            "system_instruction": system_prompt,
+                        }
+                        if max_tokens is not None:
+                            cfg_kwargs["max_output_tokens"] = int(max_tokens)
+                        if t_cfg is not None:
+                            cfg_kwargs["thinking_config"] = t_cfg
 
-                    config = types.GenerateContentConfig(**cfg_kwargs)
-                    stream = client.models.generate_content_stream(
-                        model=candidate_model,
-                        contents=user_prompt,
-                        config=config,
-                    )
-                    yielded_any = False
-                    for chunk in stream:
-                        text = getattr(chunk, "text", None)
-                        if text:
-                            yielded_any = True
-                            yield text
-                    if yielded_any:
-                        self.model_name = candidate_model
-                        return
-                except Exception as exc:
-                    if idx == 0 and primary_exc is None:
-                        primary_exc = exc
-                    last_exc = exc
-                    err_lower = str(exc).lower()
-
-                    # Se a cota/limite da API estourou, interrompe imediatamente para avisar o usuário
-                    if is_quota_limit_error(exc):
-                        raise
-
-                    # Se thinking_budget=0 não for aceito, tenta o mesmo modelo sem thinking_config
-                    if use_thinking_zero and any(
-                        k in err_lower
-                        for k in ("thinking", "budget", "invalid_argument", "400", "not supported")
-                    ):
-                        continue
-
-                    # Só faz fallback para outro modelo ativo se o atual estiver indisponível (404/503)
-                    if any(
-                        code in err_lower
-                        for code in (
-                            "404",
-                            "not found",
-                            "not_found",
-                            "no longer available",
-                            "503",
-                            "unavailable",
-                            "overloaded",
+                        config = types.GenerateContentConfig(**cfg_kwargs)
+                        stream = client.models.generate_content_stream(
+                            model=candidate_model,
+                            contents=user_prompt,
+                            config=config,
                         )
-                    ):
+                        yielded_any = False
+                        for chunk in stream:
+                            text = getattr(chunk, "text", None)
+                            if text:
+                                yielded_any = True
+                                yield text
+                        if yielded_any:
+                            self.model_name = candidate_model
+                            return
                         break
-                    raise
+                    except Exception as exc:
+                        if idx == 0 and primary_exc is None:
+                            primary_exc = exc
+                        last_exc = exc
+                        err_lower = str(exc).lower()
+
+                        # Se a cota/limite da API estourou, interrompe imediatamente para avisar o usuário
+                        if is_quota_limit_error(exc):
+                            raise
+
+                        # Retry rápido (0.35s) se for 503 temporário (alta demanda momentânea no servidor Google)
+                        if attempt_503 == 0 and any(
+                            code in err_lower for code in ("503", "unavailable", "overloaded")
+                        ):
+                            _time.sleep(0.35)
+                            continue
+
+                        # Se thinking_level não for aceito por algum endpoint específico, tenta o próximo t_cfg
+                        if t_cfg is not None and any(
+                            k in err_lower
+                            for k in ("thinking", "level", "budget", "invalid_argument", "400", "not supported")
+                        ):
+                            break
+
+                        # Faz fallback para gemini-3.8-flash se um modelo customizado retornar 404/503
+                        if any(
+                            code in err_lower
+                            for code in (
+                                "404",
+                                "not found",
+                                "not_found",
+                                "no longer available",
+                                "503",
+                                "unavailable",
+                                "overloaded",
+                            )
+                        ):
+                            break
+                        raise
+                else:
+                    continue
+                # Se saiu do loop de 503 por 404/503 definitivo, avança para o próximo candidate_model
+                if last_exc is not None and any(
+                    code in str(last_exc).lower()
+                    for code in ("404", "not found", "not_found", "no longer available", "503", "unavailable", "overloaded")
+                ):
+                    break
 
         if primary_exc is not None:
             raise primary_exc
