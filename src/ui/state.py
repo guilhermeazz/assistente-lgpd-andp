@@ -18,12 +18,17 @@ from src.rag.prompts import normalize_language_level
 from src.rag.providers import (
     DEFAULT_OLLAMA_URL,
     MODEL_CATALOG,
+    OPERATING_MODE_PROFILES,
     PROVIDER_DEFAULT_MODELS,
     PROVIDER_LABELS,
     detect_runtime_environment,
     get_available_providers,
     get_model_metadata,
+    get_model_performance_context,
+    get_models_for_operating_mode,
+    get_preferred_model_for_mode,
     get_selectable_models,
+    infer_operating_mode_for_model,
     normalize_provider_key,
 )
 
@@ -94,7 +99,27 @@ def sync_provider_and_model_state(
 
     current_model = str(target_state.get("selected_model") or "").strip()
     if not is_model_valid_for_provider(provider_key, current_model):
-        target_state["selected_model"] = PROVIDER_DEFAULT_MODELS[provider_key]
+        active_mode = str(target_state.get("preset_mode") or "fast_eco")
+        target_state["selected_model"] = get_preferred_model_for_mode(provider_key, active_mode)
+
+    # Convergência automática: garante que `preset_mode` reflita a capacidade real do modelo selecionado
+    raw_mode = str(target_state.get("preset_mode") or "")
+    if raw_mode not in OPERATING_MODE_PROFILES:
+        target_state["preset_mode"] = (
+            "local_offline"
+            if provider_key == "ollama"
+            else infer_operating_mode_for_model(provider_key, target_state["selected_model"])
+        )
+    elif raw_mode == "local_offline" and not ollama_online:
+        target_state["preset_mode"] = infer_operating_mode_for_model(
+            provider_key, target_state["selected_model"]
+        )
+
+    target_state["performance_context"] = get_model_performance_context(
+        provider_id=provider_key,
+        model_id=target_state["selected_model"],
+        operating_mode=target_state["preset_mode"],
+    )
 
     target_state["language_level"] = normalize_language_level(
         str(target_state.get("language_level") or "equilibrado")
@@ -102,14 +127,55 @@ def sync_provider_and_model_state(
     return runtime_env
 
 
+def on_operating_mode_change(
+    state: Optional[MutableMapping[str, Any]] = None,
+    new_mode: Optional[str] = None,
+    ollama_online: bool = False,
+) -> None:
+    """
+    Convergência Modo -> Modelo:
+    Quando o usuário seleciona um Contexto de Performance (`fast_eco`, `high_precision`, `local_offline`),
+    seleciona automaticamente o modelo do provedor ativo cuja capacidade melhor se encaixa no contexto.
+    """
+    target_state: MutableMapping[str, Any] = state if state is not None else st.session_state
+    chosen = str(new_mode or target_state.get("preset_mode") or "fast_eco").strip()
+
+    mode_key = "fast_eco"
+    for k, prof in OPERATING_MODE_PROFILES.items():
+        if chosen in (k, prof["label"], prof["short_label"]):
+            mode_key = k
+            break
+
+    if mode_key == "local_offline" and ollama_online:
+        prov_key = "ollama"
+        target_state["provider_key"] = "ollama"
+    else:
+        if mode_key == "local_offline" and not ollama_online:
+            mode_key = "fast_eco"
+        prov_key = str(target_state.get("provider_key") or "gemini")
+        if prov_key == "ollama" and not ollama_online:
+            prov_key = "gemini"
+            target_state["provider_key"] = "gemini"
+
+    best_model = get_preferred_model_for_mode(prov_key, mode_key)
+    target_state["preset_mode"] = mode_key
+    target_state["selected_model"] = best_model
+    target_state["sidebar_model_select"] = best_model
+    target_state["performance_context"] = get_model_performance_context(
+        provider_id=prov_key,
+        model_id=best_model,
+        operating_mode=mode_key,
+    )
+
+
 def on_provider_change(
     state: Optional[MutableMapping[str, Any]] = None,
     new_provider: Optional[str] = None,
 ) -> None:
     """
-    Callback acionado ao trocar o seletor de Provedor na Sidebar (`on_change`):
-    Atualiza `provider_key` e redefine imediatamente `selected_model` para o modelo padrão
-    válido do novo provedor, evitando qualquer erro de modelo incompatível.
+    Callback acionado ao trocar o seletor de Provedor (`on_change`):
+    Atualiza `provider_key` e converge `selected_model` para o modelo do novo provedor
+    compatível com o Modo de Operação ativo.
     """
     target_state: MutableMapping[str, Any] = state if state is not None else st.session_state
     label_or_key = (
@@ -123,16 +189,33 @@ def on_provider_change(
     except ValueError:
         prov_key = "gemini"
 
+    active_mode = str(target_state.get("preset_mode") or "fast_eco")
+    if prov_key == "ollama":
+        active_mode = "local_offline"
+    elif active_mode == "local_offline":
+        active_mode = "fast_eco"
+
+    converged_model = get_preferred_model_for_mode(prov_key, active_mode)
     target_state["provider_key"] = prov_key
-    target_state["selected_model"] = PROVIDER_DEFAULT_MODELS[prov_key]
-    target_state["sidebar_model_select"] = PROVIDER_DEFAULT_MODELS[prov_key]
+    target_state["preset_mode"] = active_mode
+    target_state["selected_model"] = converged_model
+    target_state["sidebar_model_select"] = converged_model
+    target_state["performance_context"] = get_model_performance_context(
+        provider_id=prov_key,
+        model_id=converged_model,
+        operating_mode=active_mode,
+    )
 
 
 def on_model_change(
     state: Optional[MutableMapping[str, Any]] = None,
     new_model: Optional[str] = None,
 ) -> None:
-    """Callback acionado ao trocar o modelo selecionado na Sidebar."""
+    """
+    Convergência Modelo -> Modo:
+    Quando o usuário escolhe um modelo específico, atualiza automaticamente o contexto de performance
+    (`preset_mode`, `top_k`, `max_context_tokens` e `max_history_turns`) de acordo com a capacidade do modelo.
+    """
     target_state: MutableMapping[str, Any] = state if state is not None else st.session_state
     prov_key = str(target_state.get("provider_key") or "gemini")
     candidate = str(new_model or target_state.get("sidebar_model_select") or "").strip()
@@ -140,6 +223,19 @@ def on_model_change(
         target_state["selected_model"] = candidate
     else:
         target_state["selected_model"] = PROVIDER_DEFAULT_MODELS[prov_key]
+
+    resolved_model = target_state["selected_model"]
+    inferred_mode = (
+        "local_offline"
+        if prov_key == "ollama" and target_state.get("preset_mode") == "local_offline"
+        else infer_operating_mode_for_model(prov_key, resolved_model)
+    )
+    target_state["preset_mode"] = inferred_mode
+    target_state["performance_context"] = get_model_performance_context(
+        provider_id=prov_key,
+        model_id=resolved_model,
+        operating_mode=inferred_mode,
+    )
 
 
 def init_session_state(
@@ -169,9 +265,22 @@ def init_session_state(
     if "api_keys" not in target_state:
         target_state["api_keys"] = {
             "gemini": "",
+            "groq": "",
+            "openrouter": "",
             "openai": "",
             "anthropic": "",
         }
+    else:
+        for pk in ("gemini", "groq", "openrouter", "openai", "anthropic"):
+            target_state["api_keys"].setdefault(pk, "")
+    if "preset_mode" not in target_state:
+        target_state["preset_mode"] = (
+            "local_offline" if runtime_env.get("ollama_online") else "fast_eco"
+        )
+    if "active_page" not in target_state:
+        target_state["active_page"] = "🏠 Início & Chat Consultivo"
+    if "settings_category" not in target_state:
+        target_state["settings_category"] = "⚡ Modo & Modelo de IA"
     if "gemini_api_key" not in target_state:
         target_state["gemini_api_key"] = ""
     if "messages" not in target_state:

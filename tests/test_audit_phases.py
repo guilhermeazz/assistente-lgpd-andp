@@ -371,7 +371,11 @@ def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
     )
 
     assert "gemini-2.0-flash" not in MODEL_CATALOG["gemini"]
-    assert get_selectable_models("gemini") == ["gemini-3.8-flash"]
+    assert get_selectable_models("gemini") == [
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemma-4-27b-it",
+    ]
 
     # 1. Gemini 3.8 Flash deve chamar generate_content_stream com thinking_level=MINIMAL e include_thoughts=False
     captured_calls = []
@@ -483,3 +487,105 @@ def test_gemini_38_no_deprecated_fallback_and_quota_limit_alerts() -> None:
     )
     assert ascii_err_info["category"] == "auth"
     assert "acentos" in ascii_err_info["message"]
+
+
+def test_phase8_sqlite_fts5_abstention_gate_and_free_tier_providers() -> None:
+    """
+    Valida as melhorias da auditoria completa:
+    1. Adaptadores Free Tier unificados (`GroqProvider` e `OpenRouterProvider`).
+    2. Índice léxico persistido SQLite FTS5 (`SQLiteFTS5Index`).
+    3. Formatação de embeddings `format_embedding_input` (`query:` / `passage:` para família E5 e remoção de breadcrumb).
+    4. Abstention Gate (`should_abstain`) barrando perguntas fora do escopo com custo 0 de tokens de LLM.
+    5. Citações numeradas `[1]`, `[2]` e hash SHA-256 nos chunks selecionados.
+    """
+    from src.rag.engine import (
+        E5_EMBEDDING_MODEL,
+        SQLiteFTS5Index,
+        format_embedding_input,
+        strip_chunk_breadcrumb,
+    )
+    from src.rag.providers import (
+        GroqProvider,
+        OpenRouterProvider,
+        create_llm_provider,
+    )
+
+    p_groq = create_llm_provider("Groq Cloud (Free Tier / LPU)", api_key="gsk_1234567890abcdefghij")
+    assert isinstance(p_groq, GroqProvider)
+    assert p_groq.model_name == "llama-3.3-70b-versatile"
+
+    p_or = create_llm_provider("OpenRouter (Free Tier)", api_key="sk-or-v1-1234567890abcdefghij")
+    assert isinstance(p_or, OpenRouterProvider)
+    assert p_or.model_name == "qwen/qwen-2.5-72b-instruct:free"
+
+    # Verifica prefixos E5 e limpeza de breadcrumb
+    raw_doc = "[Lei nº 13.709/2018 (LGPD) | CAPÍTULO I | Seção I | Art. 5º]\nArt. 5º Para os fins desta Lei, considera-se:"
+    assert strip_chunk_breadcrumb(raw_doc, artigo="Art. 5º").startswith("Art. 5º")
+    assert format_embedding_input("O que é dado sensível?", is_query=True, model_name=E5_EMBEDDING_MODEL).startswith(
+        "query: "
+    )
+    assert format_embedding_input(raw_doc, is_query=False, model_name=E5_EMBEDDING_MODEL).startswith(
+        "passage: Art. 5º"
+    )
+
+    # Verifica busca léxica SQLite FTS5
+    fts = SQLiteFTS5Index(db_path=None)
+    fts.sync_chunks(
+        [
+            {"id": "c1", "texto": "Art. 48 comunicação de incidente de segurança à ANPD", "metadata": {"artigo": "Art. 48"}},
+            {"id": "c2", "texto": "Art. 14 tratamento de dados de crianças e adolescentes", "metadata": {"artigo": "Art. 14"}},
+        ]
+    )
+    hits = fts.search("incidente segurança ANPD", top_n=2)
+    assert hits and hits[0][0] == "c1"
+
+    # Verifica Abstention Gate barrando pergunta fora do escopo sem chamar LLM
+    engine = LGPDRagEngine()
+    mock_prov = MockStreamingProvider(model_name="gemini-3.5-flash-lite")
+    res_abstain = engine.ask_stream(
+        question="Qual a receita de bolo de cenoura com calda de chocolate?",
+        provider=mock_prov,
+    )
+    abstain_text = "".join(res_abstain["stream"])
+    assert res_abstain["abstained"] is True
+    assert res_abstain["estimated_tokens"] == 0
+    assert "Fora do escopo normativo" in abstain_text
+
+    # Verifica citações [1] e SHA-256 em pergunta válida
+    res_valid = engine.ask_stream(
+        question="Quais são os direitos do titular no Art. 18 da LGPD?",
+        provider=mock_prov,
+    )
+    _ = "".join(res_valid["stream"])
+    assert res_valid["abstained"] is False
+    assert 'id="[1]"' in res_valid["context_xml"]
+    assert res_valid["retrieved_chunks"][0]["citation_tag"] == "[1]"
+    assert len(res_valid["retrieved_chunks"][0]["sha256"]) == 64
+
+    # 6. Verifica convergência bidirecional entre Modo de Operação e Capacidade do Modelo
+    from src.rag.providers import (
+        get_model_performance_context,
+        get_models_for_operating_mode,
+        get_preferred_model_for_mode,
+        infer_operating_mode_for_model,
+    )
+    from src.ui.state import on_model_change, on_operating_mode_change
+
+    assert infer_operating_mode_for_model("gemini", "gemini-3.5-flash-lite") == "fast_eco"
+    assert infer_operating_mode_for_model("gemini", "gemini-3.8-flash") == "high_precision"
+    assert get_preferred_model_for_mode("gemini", "fast_eco") == "gemini-3.5-flash-lite"
+    assert get_preferred_model_for_mode("gemini", "high_precision") == "gemini-3.8-flash"
+    assert get_models_for_operating_mode("gemini", "high_precision")[0] == "gemini-3.8-flash"
+
+    conv_state = {"provider_key": "gemini", "selected_model": "gemini-3.5-flash-lite", "preset_mode": "fast_eco"}
+    on_operating_mode_change(state=conv_state, new_mode="high_precision", ollama_online=False)
+    assert conv_state["preset_mode"] == "high_precision"
+    assert conv_state["selected_model"] == "gemini-3.8-flash"
+    perf_ctx = get_model_performance_context("gemini", conv_state["selected_model"], conv_state["preset_mode"])
+    assert perf_ctx["top_k"] == 5
+    assert perf_ctx["max_context_tokens"] == 2200
+
+    on_model_change(state=conv_state, new_model="gemini-3.5-flash-lite")
+    assert conv_state["preset_mode"] == "fast_eco"
+    assert conv_state["performance_context"]["top_k"] == 3
+    assert conv_state["performance_context"]["max_context_tokens"] == 1200

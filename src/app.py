@@ -36,7 +36,7 @@ from src.rag.engine import (
 from src.ui.architecture import render_project_details_page
 from src.ui.chat import render_chat_page
 from src.ui.components import inject_custom_css
-from src.ui.sidebar import render_sidebar
+from src.ui.sidebar import render_top_navbar
 from src.ui.state import init_session_state
 
 
@@ -76,13 +76,14 @@ def main() -> None:
     st.set_page_config(
         page_title="LGPD.AI — Assistente Inteligente LGPD & ANPD",
         page_icon="🛡️",
-        layout="wide",
+        layout="centered",
+        initial_sidebar_state="collapsed",
     )
     inject_custom_css()
     runtime_env = init_session_state()
     engine = get_cached_rag_engine()
 
-    selected_page = render_sidebar(engine=engine, runtime_env=runtime_env)
+    selected_page = render_top_navbar(engine=engine, runtime_env=runtime_env)
     if selected_page == "🏠 Início & Chat Consultivo":
         render_chat_page(engine=engine, runtime_env=runtime_env)
     else:

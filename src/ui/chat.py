@@ -1,5 +1,5 @@
 """
-Fluxo Conversacional, Onboarding, Indicador Animado em Duas Fases e Telemetria (src/ui/chat.py)
+Fluxo Conversacional Minimalista, Sugestões Iniciais, Streaming em 2 Fases e Telemetria (src/ui/chat.py)
 """
 
 from __future__ import annotations
@@ -21,19 +21,19 @@ from src.ui.components import detect_pii, mask_pii, render_hero_header
 
 ONBOARDING_SUGGESTIONS: List[Dict[str, str]] = [
     {
-        "label": "📋 Direitos do Titular (Art. 18)",
+        "label": "Direitos do Titular e Prazo Legal  ·  Art. 18 e Art. 19",
         "prompt": "Quais são os direitos do titular previstos no Art. 18 da LGPD e o prazo de atendimento do Art. 19?",
     },
     {
-        "label": "⚖️ Base Legal e Biometria (Art. 7º e 11)",
+        "label": "Base Legal e Biometria Facial  ·  Art. 7º e Art. 11",
         "prompt": "Posso usar legítimo interesse para tratar biometria facial ou preciso seguir o Art. 11 da LGPD?",
     },
     {
-        "label": "🚨 Incidente de Segurança (Art. 48)",
+        "label": "Comunicação de Incidente à ANPD  ·  Art. 48",
         "prompt": "Qual é o prazo e os critérios para comunicar um incidente de segurança ou vazamento à ANPD (Art. 48)?",
     },
     {
-        "label": "💰 Multas e Dosimetria (Res. ANPD nº 4/2023)",
+        "label": "Sanções e Critérios de Dosimetria  ·  Res. ANPD nº 4/2023",
         "prompt": "Quais são as sanções do Art. 52 da LGPD e os critérios de dosimetria e alíquotas da Resolução CD/ANPD nº 4/2023?",
     },
 ]
@@ -41,7 +41,7 @@ ONBOARDING_SUGGESTIONS: List[Dict[str, str]] = [
 
 def _render_response_telemetry_caption(trace: Dict[str, Any]) -> None:
     """
-    Exibe telemetria discreta abaixo da resposta (Fase 7.2):
+    Exibe telemetria discreta e minimalista abaixo da resposta:
     `Modelo · Nível · Busca (ms) · 1º token (ms) · Total (s) · ~Tokens`
     """
     if not trace:
@@ -56,8 +56,8 @@ def _render_response_telemetry_caption(trace: Dict[str, Any]) -> None:
     est_tokens = trace.get("estimated_tokens", 0)
 
     st.caption(
-        f"🤖 `{model_used}` · 🗣️ `{lang_label}` · ⚡ Busca: `{retrieval_ms} ms` · "
-        f"⏱️ 1º token: `{ttft_ms} ms` · 🏁 Total: `{total_s:.2f} s` · 🪙 `~{est_tokens} tokens`"
+        f"Modelo: `{model_used}` · Nível: `{lang_label}` · Busca: `{retrieval_ms} ms` · "
+        f"1º token: `{ttft_ms} ms` · Total: `{total_s:.2f} s` · `~{est_tokens} tokens`"
     )
 
 
@@ -65,17 +65,17 @@ def _render_sources_expander(
     retrieved_chunks: List[Dict[str, Any]],
     trace: Dict[str, Any] | None = None,
 ) -> None:
-    """Renderiza `st.expander(f'Ver fontes utilizadas ({len(chunks)})')` com trechos e scores."""
+    """Renderiza `st.expander(f'Ver fontes normativas utilizadas ({len(chunks)})')` com trechos, scores e SHA-256."""
     count = len(retrieved_chunks or [])
-    with st.expander(f"📚 Ver fontes utilizadas ({count})", expanded=False):
+    with st.expander(f"Fontes normativas utilizadas ({count})", expanded=False):
         trace_data = trace or {}
         matched_concepts = trace_data.get("matched_concepts") or (
             retrieved_chunks[0].get("matched_concepts", []) if retrieved_chunks else []
         )
         if matched_concepts:
-            st.markdown("**🧠 Expansão Jurídica & Fast-Path Ativados (`~0 ms`):**")
+            st.markdown("**Expansão Jurídica & Fast-Path Ativados (~0 ms):**")
             for concept in matched_concepts:
-                st.markdown(f"- 🔹 `{concept}`")
+                st.markdown(f"- `{concept}`")
             st.divider()
 
         if not retrieved_chunks:
@@ -87,24 +87,31 @@ def _render_sources_expander(
             origem = chunk.get("origem", "Busca Híbrida")
             is_cross = chunk.get("is_cross_reference", False)
             rerank_score = float(chunk.get("rerank_score", 0.0))
-            badge = "🔗 [Referência Cruzada]" if is_cross else "🎯 [Busca + Reranker]"
+            cit_tag = chunk.get("citation_tag", f"[{idx}]")
+            sha_full = str(chunk.get("sha256", "")).strip()
+            sha_short = f"{sha_full[:16]}..." if len(sha_full) > 16 else (sha_full or "n/a")
+            fonte_norma = meta.get("fonte", "LGPD/ANPD")
+            artigo_ref = meta.get("artigo") or meta.get("secao") or chunk.get("id")
+            badge = "Referência Cruzada" if is_cross else "Busca + Reranker"
 
             st.markdown(
-                f"**#{idx} {badge}** `{meta.get('breadcrumb', chunk.get('id'))}` — **Score: `{rerank_score:.2f}`**"
+                f"**{cit_tag}** `{fonte_norma} — {artigo_ref}` · *{badge}* · **Score: `{rerank_score:.2f}`**"
             )
             st.caption(
-                f"Origem: {origem} | Artigos citados: `{meta.get('artigos_citados') or 'Nenhuma'}`"
+                f"Breadcrumb: `{meta.get('breadcrumb', chunk.get('id'))}` | "
+                f"Origem: {origem} | Artigos citados: `{meta.get('artigos_citados') or 'Nenhuma'}` | "
+                f"SHA-256: `{sha_short}`"
             )
             with st.container(border=True):
                 st.markdown(chunk.get("texto", ""))
 
 
 def _render_audit_inspector(msg: Dict[str, Any]) -> None:
-    """Renderiza inspetor técnico opcional com payload XML enxuto e prompt enviado."""
+    """Renderiza inspetor técnico opcional com payload XML enxuto."""
     trace = msg.get("trace")
     if not trace:
         return
-    with st.expander("🧾 Auditoria Técnica (Payload XML & Prompt)", expanded=False):
+    with st.expander("Auditoria Técnica (Payload XML & Orçamento de Contexto)", expanded=False):
         st.caption(
             f"Tier do Modelo: `{trace.get('model_tier', 'recommended')}` | "
             f"Orçamento de Contexto: `{trace.get('context_tokens', 0)} / {trace.get('max_context_tokens', 2200)} tokens`"
@@ -113,7 +120,7 @@ def _render_audit_inspector(msg: Dict[str, Any]) -> None:
 
 
 def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None:
-    """Renderiza a página principal de Chat com Onboarding, Preflight Check e Streaming em 2 fases."""
+    """Renderiza a página principal de Chat centralizada com Onboarding minimalista e Streaming em 2 fases."""
     render_hero_header()
 
     provider_key = st.session_state["provider_key"]
@@ -122,7 +129,7 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
     effective_api_key = get_provider_api_key(provider_key, user_api_key=user_api_key)
     ollama_online = bool(runtime_env.get("ollama_online", False))
 
-    # Validação Prévia (Preflight Check — Fase 2.4)
+    # Validação Prévia (Preflight Check)
     is_ready, preflight_msg = preflight_check_provider(
         provider_id=provider_key,
         model_id=selected_model,
@@ -131,10 +138,13 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
         ollama_online=ollama_online,
     )
 
-    # Onboarding quando não houver mensagens no chat (Fase 7.2)
+    # Sugestões iniciais quando não houver mensagens no chat
     if not st.session_state["messages"]:
-        st.markdown("##### 💡 Perguntas Prontas para Iniciar:")
-        cols = st.columns(2)
+        st.markdown(
+            '<div class="onboard-section-label">Consultas Sugeridas</div>',
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(2, gap="small")
         for idx, item in enumerate(ONBOARDING_SUGGESTIONS):
             if cols[idx % 2].button(
                 item["label"],
@@ -145,12 +155,15 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
                 st.session_state["pending_suggestion"] = item["prompt"]
 
     if not is_ready:
-        st.info(preflight_msg)
+        clean_msg = preflight_msg.replace(
+            "na barra lateral esquerda",
+            "no botão de Configurações (⚙) no canto superior direito",
+        )
+        st.info(clean_msg)
 
     # Renderiza histórico de mensagens
     for msg in st.session_state["messages"]:
-        avatar = "🧑‍💼" if msg["role"] == "user" else "🛡️"
-        with st.chat_message(msg["role"], avatar=avatar):
+        with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant":
                 if msg.get("trace") is not None:
@@ -164,7 +177,7 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
                     _render_audit_inspector(msg)
 
     user_input = st.chat_input(
-        "Pergunte sobre artigos da LGPD, bases legais, incidentes ou multas da ANPD...",
+        "Consulte artigos da LGPD, bases legais, incidentes de segurança ou dosimetria da ANPD...",
         disabled=not is_ready,
     )
     active_question = user_input or st.session_state.get("pending_suggestion")
@@ -187,30 +200,30 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
             sanitized_question, pii_masked_types = mask_pii(active_question)
         else:
             st.warning(
-                f"⚠️ **Aviso de Privacidade (PII):** Detectamos `{', '.join(detected_pii.keys())}` na sua pergunta. "
-                "Recomendamos ativar o mascaramento automático na barra lateral."
+                f"Aviso de Privacidade (PII): Detectamos `{', '.join(detected_pii.keys())}` na consulta. "
+                "Recomendamos ativar o mascaramento automático nas Configurações (⚙)."
             )
 
-    with st.chat_message("user", avatar="🧑‍💼"):
+    with st.chat_message("user"):
         st.markdown(sanitized_question)
         if pii_masked_types:
             st.caption(
-                f"🛡️ *Privacy by Design: Dados pessoais ({', '.join(pii_masked_types)}) foram mascarados automaticamente antes do envio.*"
+                f"Privacy by Design: Dados pessoais ({', '.join(pii_masked_types)}) foram mascarados automaticamente antes do envio."
             )
 
-    with st.chat_message("assistant", avatar="🛡️"):
+    with st.chat_message("assistant"):
         try:
             prior_history = [
                 {"role": m["role"], "content": m["content"]}
                 for m in st.session_state["messages"]
             ]
 
-            # Fase 1 do Indicador Animado: Busca RAG com st.status recolhendo automaticamente
+            # Fase 1 do Indicador: Busca RAG com st.status recolhendo automaticamente
             with st.status(
-                "Consultando base legal da LGPD/ANPD...",
+                "Consultando base normativa da LGPD e ANPD...",
                 expanded=True,
             ) as status_box:
-                st.write("🔎 Buscando dispositivos relevantes (Fast-Path + ChromaDB + BM25 + FlashRank)...")
+                st.write("Executando busca híbrida (Fast-Path + ChromaDB + SQLite FTS5 + FlashRank)...")
                 stream_result = engine.ask_stream(
                     question=sanitized_question,
                     history=prior_history,
@@ -222,14 +235,14 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
                 )
                 chunks_found = stream_result.get("retrieved_chunks", [])
                 ret_ms = stream_result.get("retrieval_ms", 0.0)
-                st.write(f"✅ {len(chunks_found)} trechos selecionados em {ret_ms} ms.")
+                st.write(f"{len(chunks_found)} dispositivos selecionados em {ret_ms} ms.")
                 status_box.update(
-                    label=f"Base legal consultada: {len(chunks_found)} trechos selecionados em {ret_ms} ms",
+                    label=f"Base normativa consultada: {len(chunks_found)} trechos selecionados em {ret_ms} ms",
                     state="complete",
                     expanded=False,
                 )
 
-            # Fase 2 do Indicador Animado: Geração em tempo real com st.write_stream
+            # Fase 2 do Indicador: Geração em tempo real com st.write_stream
             answer_md = st.write_stream(stream_result["stream"])
             if not isinstance(answer_md, str):
                 answer_md = stream_result.get("answer", "")
@@ -264,8 +277,7 @@ def render_chat_page(engine: LGPDRagEngine, runtime_env: Dict[str, Any]) -> None
             if err_info["category"] == "quota":
                 if hasattr(st, "toast"):
                     st.toast(
-                        "⏳ Limite da sua API atingido! Verifique sua cota ou troque o modelo.",
-                        icon="⏳",
+                        "Limite da sua API atingido. Verifique sua cota ou alterne o modelo nas Configurações.",
                     )
                 st.error(err_info["message"])
                 if err_info["action_hint"]:

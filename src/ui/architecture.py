@@ -295,17 +295,17 @@ def _render_architecture_detail_cards() -> None:
     with col_a:
         st.markdown(
             '<div class="arch-card">'
-            '<h4>🌐 1. Coleta Resiliente (<code>src/ingestion/fetcher.py</code>)</h4>'
+            '<h4>01. Coleta Resiliente (<code>src/ingestion/fetcher.py</code>)</h4>'
             '<ul>'
             '<li><strong>Validação Rigorosa:</strong> Verifica magic bytes <code>%PDF-</code>, rejeita páginas HTML de erro 403/404 e garante tamanho mínimo plausível.</li>'
-            '<li><strong>Conversão & Integridade:</strong> Baixa a LGPD em <code>iso-8859-1 → UTF-8</code> com manifesto <code>SHA-256</code> e contingência anti-WAF automática.</li>'
+            '<li><strong>Conversão &amp; Integridade:</strong> Baixa a LGPD em <code>iso-8859-1 → UTF-8</code> com manifesto <code>SHA-256</code> e contingência anti-WAF automática.</li>'
             '</ul>'
             '</div>'
             '<div class="arch-card">'
-            '<h4>⚖️ 3. Busca Híbrida em 2 Estágios + Fast-Path (<code>src/rag/engine.py</code>)</h4>'
+            '<h4>03. Busca Híbrida em 2 Estágios + Fast-Path (<code>src/rag/engine.py</code>)</h4>'
             '<ul>'
             '<li><strong>Fast-Path + Expansor (~0 ms):</strong> Identifica artigos citados por Regex (<code>Art. 18</code>, <code>Art. 55-J</code>) e mapeia gírias corporativas sem custo de tokens.</li>'
-            '<li><strong>Retrieve &amp; Rerank:</strong> Top-10 <code>ChromaDB Cosine</code> (<code>MiniLM-L12-v2</code>) + <code>BM25Okapi</code> → RRF → <code>FlashRank ONNX</code> → corte rígido <code>Token Budget</code>.</li>'
+            '<li><strong>Retrieve &amp; Rerank:</strong> Top-10 <code>ChromaDB Cosine</code> (<code>MiniLM-L12-v2</code>) + <code>SQLite FTS5 / BM25</code> → RRF → <code>FlashRank ONNX</code> → corte rígido <code>Token Budget</code>.</li>'
             '</ul>'
             '</div>',
             unsafe_allow_html=True,
@@ -314,17 +314,17 @@ def _render_architecture_detail_cards() -> None:
     with col_b:
         st.markdown(
             '<div class="arch-card">'
-            '<h4>🧩 2. Parser Semântico-Estrutural (<code>src/ingestion/parser.py</code>)</h4>'
+            '<h4>02. Parser Semântico-Estrutural (<code>src/ingestion/parser.py</code>)</h4>'
             '<ul>'
             '<li><strong>Limpeza de Revogados:</strong> Decompõe tags <code>&lt;strike&gt;</code>, <code>&lt;s&gt;</code>, <code>&lt;del&gt;</code> e estilos CSS <code>line-through</code>.</li>'
-            '<li><strong>Chunking Atômico + PDFs:</strong> Preserva 79 artigos da LGPD inteiros + extrai tabelas das Resoluções ANPD (<code>4/2023</code>, <code>2/2022</code>, <code>15/2024</code>, <code>18/2024</code>) via <code>pymupdf4llm</code>.</li>'
+            '<li><strong>Chunking Hierárquico + PDFs:</strong> Subdivide artigos longos preservando o caput e extrai tabelas das Resoluções ANPD (<code>4/2023</code>, <code>2/2022</code>, <code>15/2024</code>, <code>18/2024</code>) via <code>pymupdf4llm</code>.</li>'
             '</ul>'
             '</div>'
             '<div class="arch-card">'
-            '<h4>🤖 4. Multi-LLM Tiers &amp; Privacy Guard (<code>providers.py</code> / <code>src/ui/</code>)</h4>'
+            '<h4>04. Convergência Multi-LLM &amp; Privacy Guard (<code>providers.py</code> / <code>src/ui/</code>)</h4>'
             '<ul>'
-            '<li><strong>Detecção Cloud vs. Local:</strong> Seleciona provedores Cloud no deploy e habilita <code>Ollama</code> localmente, com callbacks sincronizados de estado.</li>'
-            '<li><strong>Streaming &amp; PII:</strong> Políticas <code>recommended</code>/<code>economic</code>, streaming via <code>st.write_stream</code> e mascaramento local de CPF/CNPJ/E-mail antes de APIs externas.</li>'
+            '<li><strong>Convergência Modo ↔ Modelo:</strong> Seleciona automaticamente modelos compatíveis com o contexto de performance (Rápido &amp; Econômico vs. Alta Precisão vs. Local).</li>'
+            '<li><strong>Streaming &amp; PII:</strong> Orçamento estrito de tokens, streaming via <code>st.write_stream</code> e mascaramento local de CPF/CNPJ/E-mail antes de APIs externas.</li>'
             '</ul>'
             '</div>',
             unsafe_allow_html=True,
@@ -333,6 +333,10 @@ def _render_architecture_detail_cards() -> None:
 
 def render_project_details_page(engine: LGPDRagEngine) -> None:
     """Renderiza a página completa de Arquitetura: KPIs, Pipeline, C4 Model Nível 3 e Explorador."""
+    if st.button("← Voltar ao Chat Consultivo", key="arch_back_to_chat_btn"):
+        st.session_state["active_page"] = "🏠 Início & Chat Consultivo"
+        st.rerun()
+
     st.markdown(
         """
         <div class="lix-greeting-wrap" style="margin-bottom: 1.1rem;">
@@ -360,29 +364,29 @@ def render_project_details_page(engine: LGPDRagEngine) -> None:
     ]
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("📚 Total de Chunks", len(engine.chunks))
-    k2.metric("⚖️ Artigos da LGPD", len(lgpd_chunks))
-    k3.metric("📄 Chunks ANPD (PDF)", len(anpd_chunks))
-    k4.metric("🔗 Com Cross-Reference", len(cross_ref_chunks))
+    k1.metric("Total de Chunks", len(engine.chunks))
+    k2.metric("Chunks da LGPD", len(lgpd_chunks))
+    k3.metric("Chunks ANPD (PDF)", len(anpd_chunks))
+    k4.metric("Com Cross-Reference", len(cross_ref_chunks))
 
     st.divider()
-    st.subheader("⚙️ Pipeline Completo (Ingestão + RAG Híbrido em 2 Estágios + Streaming)")
+    st.subheader("Pipeline Completo (Ingestão + RAG Híbrido em 2 Estágios + Streaming)")
     st.markdown(build_pipeline_flow_html(), unsafe_allow_html=True)
     _render_architecture_detail_cards()
 
     st.divider()
-    st.subheader("📐 C4 Model — Nível 3 (Diagrama de Componentes)")
+    st.subheader("C4 Model — Nível 3 (Diagrama de Componentes)")
     st.caption(
         "Visão estrutural dos componentes internos do container Streamlit (UI, Core RAG Multi-Provedor e Ingestão), "
         "armazenamento local e integrações externas."
     )
     st.markdown(build_c4_level3_svg(), unsafe_allow_html=True)
-    with st.expander("📝 Código Mermaid do C4 Model (Nível 3)", expanded=False):
+    with st.expander("Código Mermaid do C4 Model (Nível 3)", expanded=False):
         st.code(get_c4_level3_mermaid(), language="mermaid")
 
     st.divider()
     st.subheader(
-        f"🗂️ Explorador Interativo dos {len(engine.chunks)} Chunks (`data/processed/chunks_lgpd.jsonl`)"
+        f"Explorador Interativo dos {len(engine.chunks)} Chunks (`data/processed/chunks_lgpd.jsonl`)"
     )
     if not engine.chunks:
         st.info("Nenhum chunk carregado.")

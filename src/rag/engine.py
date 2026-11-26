@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
@@ -58,19 +59,33 @@ logging.basicConfig(
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHUNKS_PATH = PROJECT_ROOT / "data" / "processed" / "chunks_lgpd.jsonl"
 DEFAULT_CHROMA_DIR = PROJECT_ROOT / "data" / "processed" / "chroma_db"
+DEFAULT_FTS5_DB_PATH = PROJECT_ROOT / "data" / "processed" / "lexical_fts5.db"
+DEFAULT_SHA256_MANIFEST = PROJECT_ROOT / "data" / "raw" / "sha256_manifest.json"
 LOCAL_MODELS_CACHE_DIR = PROJECT_ROOT / "data" / "models_cache"
 COLLECTION_NAME = "lgpd_anpd_normas"
 
-LOCAL_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MINILM_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+E5_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
+LOCAL_EMBEDDING_MODEL = MINILM_EMBEDDING_MODEL
 EMBEDDING_MODEL = LOCAL_EMBEDDING_MODEL
 FLASHRANK_MODEL = "ms-marco-MultiBERT-L-12"
 FLASHRANK_CACHE_DIR = "./.cache/flashrank"
 
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_GENERATION_MODEL = PROVIDER_DEFAULT_MODELS[DEFAULT_PROVIDER]
-DEFAULT_TOP_N_CANDIDATES = 8
+DEFAULT_TOP_N_CANDIDATES = 10
 DEFAULT_TOP_K = 4
 DEFAULT_MAX_CROSS_REFS = 1
+DEFAULT_ABSTENTION_THRESHOLD = 0.22
+
+ABSTENTION_RESPONSE_MD = (
+    "### 🎯 Resposta Direta\n"
+    "**Fora do escopo normativo.** Com base nos documentos oficiais carregados atualmente "
+    "(Lei nº 13.709/2018 — LGPD e Resoluções/Guias da ANPD), não há informações suficientes "
+    "para responder a este ponto específico.\n\n"
+    "> **⚠️ Ponto de Atenção:** Reformule sua pergunta mencionando o tema de proteção de dados, "
+    "privacidade, direitos do titular, incidentes de segurança ou sanções da ANPD."
+)
 
 # Retrocompatibilidade
 SYSTEM_INSTRUCTION = SYSTEM_PROMPT
@@ -79,6 +94,139 @@ SYSTEM_INSTRUCTION = SYSTEM_PROMPT
 _LOCAL_EMBEDDER_CACHE: Dict[str, Any] = {}
 _LOCAL_RERANKER_CACHE: Dict[str, Any] = {}
 _TEXT_EMBEDDING_CACHE: Dict[str, List[float]] = {}
+_SEARCH_RESULT_CACHE: Dict[Tuple[str, int, int, int, bool], List[Dict[str, Any]]] = {}
+_SHA256_MANIFEST_CACHE: Optional[Dict[str, str]] = None
+
+
+def get_source_sha256(filename: str, fallback_text: str = "") -> str:
+    """Retorna o hash SHA-256 do documento original em `data/raw/sha256_manifest.json` (ou hash do chunk)."""
+    global _SHA256_MANIFEST_CACHE
+    if _SHA256_MANIFEST_CACHE is None:
+        _SHA256_MANIFEST_CACHE = {}
+        if DEFAULT_SHA256_MANIFEST.exists():
+            try:
+                raw_data = json.loads(DEFAULT_SHA256_MANIFEST.read_text(encoding="utf-8"))
+                if isinstance(raw_data, dict):
+                    for k, v in raw_data.items():
+                        if isinstance(v, dict) and "sha256" in v:
+                            _SHA256_MANIFEST_CACHE[str(k)] = str(v["sha256"])
+                        elif isinstance(v, str):
+                            _SHA256_MANIFEST_CACHE[str(k)] = v
+            except Exception:
+                pass
+    clean_file = (filename or "").strip()
+    if clean_file and clean_file in _SHA256_MANIFEST_CACHE:
+        return _SHA256_MANIFEST_CACHE[clean_file]
+    return hashlib.sha256((fallback_text or clean_file).encode("utf-8")).hexdigest()
+
+
+def strip_chunk_breadcrumb(raw_text: str, artigo: str = "") -> str:
+    """Remove a primeira linha longa do `[Breadcrumb]` e prefixa o artigo enxuto para Embeddings e FlashRank."""
+    text = (raw_text or "").strip()
+    if text.startswith("[") and "\n" in text:
+        body = text.split("\n", 1)[1].strip()
+    else:
+        body = text
+    if artigo and not body.lower().startswith(artigo.lower()):
+        return f"{artigo}: {body}"
+    return body
+
+
+def format_embedding_input(text: str, is_query: bool = False, model_name: str = "") -> str:
+    """
+    Prepara o texto para vetorização:
+    - Aplica prefixos obrigatórios `query: ` / `passage: ` quando o modelo é da família `e5` (`intfloat/multilingual-e5-*`).
+    - Remove o breadcrumb verboso dos documentos para focar os tokens no conteúdo normativo.
+    """
+    cleaned = text.strip() if is_query else strip_chunk_breadcrumb(text)
+    if "e5" in (model_name or "").lower():
+        prefix = "query: " if is_query else "passage: "
+        if not cleaned.lower().startswith(("query: ", "passage: ")):
+            return f"{prefix}{cleaned}"
+    return cleaned
+
+
+class SQLiteFTS5Index:
+    """
+    Índice Léxico Persistido com SQLite FTS5 (`bm25(chunks_fts)` nativo em C):
+    Evita reconstruir estruturas BM25 em Python a cada inicialização quando o arquivo
+    `data/processed/lexical_fts5.db` já está sincronizado com os chunks atuais.
+    """
+
+    def __init__(self, db_path: Optional[Path] = DEFAULT_FTS5_DB_PATH) -> None:
+        self.db_path = Path(db_path) if db_path is not None else None
+        self._mem_conn: Optional[sqlite3.Connection] = None
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.db_path is None:
+            if self._mem_conn is None:
+                self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            return self._mem_conn
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        return sqlite3.connect(str(self.db_path), check_same_thread=False)
+
+    def sync_chunks(self, chunks: List[Dict[str, Any]]) -> None:
+        if not chunks:
+            return
+        digest = hashlib.md5(
+            "|".join(f"{c['id']}:{len(c.get('texto', ''))}" for c in chunks).encode("utf-8")
+        ).hexdigest()
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS fts_meta (k TEXT PRIMARY KEY, v TEXT)")
+            cur.execute("SELECT v FROM fts_meta WHERE k = 'digest'")
+            row = cur.fetchone()
+            if row and row[0] == digest:
+                return
+
+            cur.execute("DROP TABLE IF EXISTS chunks_fts")
+            cur.execute(
+                "CREATE VIRTUAL TABLE chunks_fts USING fts5("
+                "chunk_id UNINDEXED, artigo, texto, tokenize='unicode61'"
+                ")"
+            )
+            rows_to_insert = [
+                (
+                    str(c["id"]),
+                    str(c.get("metadata", {}).get("artigo", "")),
+                    str(c.get("texto", "")),
+                )
+                                for c in chunks
+            ]
+            cur.executemany(
+                "INSERT INTO chunks_fts (chunk_id, artigo, texto) VALUES (?, ?, ?)",
+                rows_to_insert,
+            )
+            cur.execute(
+                "INSERT OR REPLACE INTO fts_meta (k, v) VALUES ('digest', ?)",
+                (digest,),
+            )
+            conn.commit()
+        finally:
+            if self.db_path is not None:
+                conn.close()
+
+    def search(self, query: str, top_n: int = 10) -> List[Tuple[str, float]]:
+        tokens = [t for t in tokenize_pt(query) if len(t) >= 2][:24]
+        if not tokens:
+            return []
+        fts_query = " OR ".join(f'"{t.replace(chr(34), "")}"' for t in dict.fromkeys(tokens))
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chunk_id, -bm25(chunks_fts, 2.5, 1.0) AS score "
+                "FROM chunks_fts WHERE chunks_fts MATCH ? "
+                "ORDER BY score DESC LIMIT ?",
+                (fts_query, int(top_n)),
+            )
+            return [(str(r[0]), round(max(0.0, float(r[1])), 4)) for r in cur.fetchall()]
+        except Exception:
+            return []
+        finally:
+            if self.db_path is not None:
+                conn.close()
 
 
 def tokenize_pt(text: str) -> List[str]:
@@ -133,7 +281,11 @@ def trim_chat_history(
 
 
 def get_local_embedder(model_name: str = LOCAL_EMBEDDING_MODEL) -> Any:
-    """Carrega e mantém em cache singleton o modelo SentenceTransformer local."""
+    """
+    Carrega e mantém em cache singleton o modelo SentenceTransformer local.
+    Amplia `max_seq_length` de 128 para 384 tokens (suportado pelo transformer base de 512 posições),
+    eliminando o truncamento silencioso de artigos da LGPD.
+    """
     if model_name not in _LOCAL_EMBEDDER_CACHE:
         import torch
         from sentence_transformers import SentenceTransformer
@@ -147,16 +299,30 @@ def get_local_embedder(model_name: str = LOCAL_EMBEDDING_MODEL) -> Any:
         cache_dir = str(LOCAL_MODELS_CACHE_DIR)
         logger.info("Carregando modelo de embedding local: %s", model_name)
         try:
-            _LOCAL_EMBEDDER_CACHE[model_name] = SentenceTransformer(
+            model = SentenceTransformer(
                 model_name,
                 cache_folder=cache_dir,
                 local_files_only=True,
             )
         except Exception:
-            _LOCAL_EMBEDDER_CACHE[model_name] = SentenceTransformer(
-                model_name,
-                cache_folder=cache_dir,
-            )
+            try:
+                model = SentenceTransformer(
+                    model_name,
+                    cache_folder=cache_dir,
+                )
+            except Exception:
+                # Fallback offline seguro para o modelo MiniLM já cacheado em data/models_cache
+                model = SentenceTransformer(
+                    MINILM_EMBEDDING_MODEL,
+                    cache_folder=cache_dir,
+                    local_files_only=True,
+                )
+        try:
+            if getattr(model, "max_seq_length", 128) < 256:
+                model.max_seq_length = 256
+        except Exception:
+            pass
+        _LOCAL_EMBEDDER_CACHE[model_name] = model
     return _LOCAL_EMBEDDER_CACHE[model_name]
 
 
@@ -274,6 +440,12 @@ class LGPDRagEngine:
         self.chunks_by_id: Dict[str, Dict[str, Any]] = {}
         self.chunks_by_article: Dict[str, Dict[str, Any]] = {}
         self.bm25: Optional[BM25Okapi] = None
+        fts_path = (
+            DEFAULT_FTS5_DB_PATH
+            if (not in_memory_chroma and self.chunks_path == DEFAULT_CHUNKS_PATH)
+            else None
+        )
+        self.fts_index = SQLiteFTS5Index(db_path=fts_path)
         self._using_fallback_embeddings: bool = False
         self.last_matched_concepts: List[str] = []
         self.last_expanded_query: str = ""
@@ -310,7 +482,7 @@ class LGPDRagEngine:
                     self.chunks.append(item)
                     self.chunks_by_id[item["id"]] = item
                     art = str(item.get("metadata", {}).get("artigo", "")).strip()
-                    if art:
+                    if art and art not in self.chunks_by_article:
                         self.chunks_by_article[art] = item
 
         if self.chunks_path == DEFAULT_CHUNKS_PATH and len(self.chunks) < 65:
@@ -337,10 +509,14 @@ class LGPDRagEngine:
                 logger.warning("Não foi possível reconstruir base automaticamente: %s", exc)
 
         if self.chunks:
+            try:
+                self.fts_index.sync_chunks(self.chunks)
+            except Exception as exc:
+                logger.warning("SQLite FTS5 sync falhou (%s); usando BM25Okapi em memória.", exc)
             tokenized_corpus = [tokenize_pt(c["texto"]) for c in self.chunks]
             self.bm25 = BM25Okapi(tokenized_corpus)
             logger.info(
-                "Índice lexical BM25 inicializado com %d chunks (%d artigos indexados por chave direta).",
+                "Índice lexical FTS5 + BM25 inicializado com %d chunks (%d artigos indexados por chave direta).",
                 len(self.chunks),
                 len(self.chunks_by_article),
             )
@@ -368,12 +544,17 @@ class LGPDRagEngine:
         self,
         texts: List[str],
         use_mock_embeddings: bool = False,
+        is_query: bool = False,
     ) -> List[List[float]]:
         if use_mock_embeddings or self._using_fallback_embeddings:
             return [self._deterministic_test_embedding(t, dim=384) for t in texts]
 
+        prepared_texts = [
+            format_embedding_input(t, is_query=is_query, model_name=self.embedding_model_name)
+            for t in texts
+        ]
         try:
-            missing = [t for t in texts if t not in _TEXT_EMBEDDING_CACHE]
+            missing = [t for t in prepared_texts if t not in _TEXT_EMBEDDING_CACHE]
             if missing:
                 embedder = self._get_embedder()
                 vectors = embedder.encode(
@@ -384,7 +565,7 @@ class LGPDRagEngine:
                 )
                 for t_str, vec in zip(missing, vectors):
                     _TEXT_EMBEDDING_CACHE[t_str] = vec.tolist()
-            return [_TEXT_EMBEDDING_CACHE[t] for t in texts]
+            return [_TEXT_EMBEDDING_CACHE[t] for t in prepared_texts]
         except Exception as exc:
             logger.warning(
                 "Modelo SentenceTransformer indisponível (%s); ativando embedding local determinístico 384-d.",
@@ -409,6 +590,7 @@ class LGPDRagEngine:
         use_mock_embeddings: bool = False,
     ) -> int:
         _ = api_key
+        _SEARCH_RESULT_CACHE.clear()
         self._load_local_chunks_and_bm25()
         if not self.chunks:
             raise RuntimeError(
@@ -549,12 +731,15 @@ class LGPDRagEngine:
                 passages = [
                     {
                         "id": item["id"],
-                        "text": item["texto"][:90],
+                        "text": strip_chunk_breadcrumb(
+                            item["texto"],
+                            artigo=str(item.get("metadata", {}).get("artigo", "")),
+                        )[:240],
                         "meta": item["metadata"],
                     }
                     for item in candidates
                 ]
-                rerank_req = RerankRequest(query=original_query[:65], passages=passages)
+                rerank_req = RerankRequest(query=original_query[:80], passages=passages)
                 reranked_raw = reranker.rerank(rerank_req)
 
                 raw_score_by_id: Dict[str, float] = {
@@ -651,10 +836,21 @@ class LGPDRagEngine:
         self.last_matched_concepts = matched_concepts
         anchor_articles = list(dict.fromkeys(direct_articles + extract_anchor_articles(expanded_query)))
 
+        cache_key = (
+            f"{self.chunks_path}::{query.strip().lower()}",
+            int(top_k),
+            int(max_cross_refs),
+            int(top_n),
+            bool(use_mock_embeddings),
+        )
+        if cache_key in _SEARCH_RESULT_CACHE:
+            return [dict(item) for item in _SEARCH_RESULT_CACHE[cache_key]]
+
         # Estágio 1.A: Top-10 Vetorial no ChromaDB (métrica cosine)
         query_emb = self._embed_texts(
             [expanded_query],
             use_mock_embeddings=use_mock_embeddings,
+            is_query=True,
         )[0]
 
         effective_top_n = max(top_n, top_k)
@@ -691,10 +887,15 @@ class LGPDRagEngine:
                 chroma_docs[doc_id] = chroma_res["documents"][0][rank_idx - 1]
                 chroma_metas[doc_id] = chroma_res["metadatas"][0][rank_idx - 1]
 
-        # Estágio 1.B: Top-10 Lexical com BM25Okapi
+        # Estágio 1.B: Top-10 Lexical via SQLite FTS5 persistido (com fallback para BM25Okapi)
         bm25_ranks: Dict[str, int] = {}
         bm25_scores_map: Dict[str, float] = {}
-        if self.bm25 is not None and self.chunks:
+        fts_hits = self.fts_index.search(expanded_query, top_n=n_query) if self.chunks else []
+        if fts_hits:
+            for rank_idx, (c_id, score_val) in enumerate(fts_hits, start=1):
+                bm25_ranks[c_id] = rank_idx
+                bm25_scores_map[c_id] = score_val
+        elif self.bm25 is not None and self.chunks:
             query_tokens = tokenize_pt(expanded_query)
             raw_scores = self.bm25.get_scores(query_tokens)
             scored_indices = sorted(
@@ -875,7 +1076,89 @@ class LGPDRagEngine:
                             exc,
                         )
 
-        return top_chunks + expanded_chunks
+        final_chunks = top_chunks + expanded_chunks
+        for idx, c_item in enumerate(final_chunks, start=1):
+            meta = c_item.get("metadata", {})
+            c_item["citation_index"] = idx
+            c_item["citation_tag"] = f"[{idx}]"
+            c_item["sha256"] = get_source_sha256(
+                str(meta.get("arquivo", "")),
+                fallback_text=str(c_item.get("texto", "")),
+            )
+        if len(_SEARCH_RESULT_CACHE) >= 128:
+            _SEARCH_RESULT_CACHE.clear()
+        _SEARCH_RESULT_CACHE[cache_key] = [dict(item) for item in final_chunks]
+        return final_chunks
+
+    @staticmethod
+    def should_abstain(
+        query: str,
+        retrieved_chunks: List[Dict[str, Any]],
+        matched_concepts: Optional[List[str]] = None,
+        fast_path_articles: Optional[List[str]] = None,
+        min_vector_score: float = 0.34,
+        min_rerank_score: float = DEFAULT_ABSTENTION_THRESHOLD,
+    ) -> bool:
+        """
+        Abstention Gate (Limiar de Confiança — Fase 2.4):
+        Barra perguntas claramente fora do escopo de proteção de dados/LGPD/ANPD
+        antes de acionar a LLM, economizando 100% dos tokens de geração.
+        """
+        if not retrieved_chunks:
+            return True
+        if fast_path_articles or matched_concepts:
+            return False
+
+        q_lower = (query or "").lower()
+        domain_keywords = (
+            "lgpd",
+            "anpd",
+            "dado",
+            "dados",
+            "titular",
+            "controlador",
+            "operador",
+            "encarregado",
+            "dpo",
+            "tratamento",
+            "consentimento",
+            "privacidade",
+            "segurança",
+            "incidente",
+            "vazamento",
+            "multa",
+            "sanção",
+            "sanções",
+            "dosimetria",
+            "lei",
+            "artigo",
+            "art.",
+            "resolução",
+            "base legal",
+            "legítimo interesse",
+            "cadastro",
+            "cliente",
+            "usuário",
+            "empresa",
+            "site",
+            "sistema",
+            "compartilhamento",
+            "retenção",
+            "eliminação",
+            "relatório",
+            "ripd",
+            "ropa",
+        )
+        if any(kw in q_lower for kw in domain_keywords):
+            return False
+
+        max_vec = max((float(c.get("vector_score", 0.0)) for c in retrieved_chunks), default=0.0)
+        max_rerank = max((float(c.get("rerank_score", 0.0)) for c in retrieved_chunks), default=0.0)
+        max_bm25 = max((float(c.get("bm25_score", 0.0)) for c in retrieved_chunks), default=0.0)
+
+        if max_vec < min_vector_score and (max_rerank < min_rerank_score or max_bm25 < 3.5):
+            return True
+        return False
 
     @staticmethod
     def select_chunks_within_token_budget(
@@ -883,9 +1166,10 @@ class LGPDRagEngine:
         max_context_tokens: int = 2200,
     ) -> Tuple[List[Dict[str, Any]], str, int]:
         """
-        Orçamento Rígido de Contexto (Fase 5.3):
-        - Remove metadados ruidosos do payload XML enviado à LLM (caminhos de arquivo, hashes, scores internos),
-          mantendo apenas o identificador limpo da fonte/artigo e o texto normativo.
+        Orçamento Rígido de Contexto com Citações Numéricas `[1]`, `[2]` (Fases 1 e 2):
+        - Formata cada fonte com identificador numérico curto `id="[1]"` para reduzir tokens de saída da LLM.
+        - Remove metadados ruidosos do payload XML enviado à LLM, mantendo os metadados completos
+          (incluindo `sha256` e `citation_tag`) no dicionário para exibição rica na UI.
         - Para de adicionar chunks assim que atingir `max_context_tokens` do Tier do modelo selecionado.
         """
         if max_context_tokens <= 0 or not retrieved_chunks:
@@ -896,34 +1180,48 @@ class LGPDRagEngine:
         selected_chunks: List[Dict[str, Any]] = []
         blocks: List[str] = ["<contexto_normativo>"]
 
-        for item in retrieved_chunks:
+        for idx, item in enumerate(retrieved_chunks, start=1):
             meta = item.get("metadata", {})
             fonte = str(meta.get("fonte", "LGPD/ANPD")).strip()
             artigo = str(meta.get("artigo", "")).strip()
             secao = str(meta.get("secao", "")).strip()
             clean_source = f"{fonte} | {artigo}" if artigo else f"{fonte} | {secao}"
+            cit_tag = f"[{idx}]"
 
             raw_text = str(item.get("texto", "")).strip()
-            block_str = f'  <fonte ref="{clean_source}">\n{raw_text}\n  </fonte>'
+            block_str = f'  <fonte id="{cit_tag}" ref="{clean_source}">\n{raw_text}\n  </fonte>'
             block_tokens = estimate_tokens(block_str)
 
             if used_tokens + block_tokens > max_context_tokens:
-                # Se ainda não adicionou nenhum chunk, trunca o primeiro para caber estritamente no orçamento
                 if not selected_chunks:
                     remaining_budget = max(30, max_context_tokens - used_tokens - 15)
                     max_chars = int(remaining_budget * 3.6)
                     truncated_text = raw_text[:max_chars].rstrip() + "..."
-                    block_str = f'  <fonte ref="{clean_source}">\n{truncated_text}\n  </fonte>'
+                    block_str = f'  <fonte id="{cit_tag}" ref="{clean_source}">\n{truncated_text}\n  </fonte>'
                     t_tokens = estimate_tokens(block_str)
                     if used_tokens + t_tokens <= max_context_tokens:
+                        enriched = dict(item)
+                        enriched["citation_index"] = idx
+                        enriched["citation_tag"] = cit_tag
+                        enriched.setdefault(
+                            "sha256",
+                            get_source_sha256(str(meta.get("arquivo", "")), fallback_text=raw_text),
+                        )
                         blocks.append(block_str)
                         used_tokens += t_tokens
-                        selected_chunks.append(item)
+                        selected_chunks.append(enriched)
                 break
 
+            enriched = dict(item)
+            enriched["citation_index"] = idx
+            enriched["citation_tag"] = cit_tag
+            enriched.setdefault(
+                "sha256",
+                get_source_sha256(str(meta.get("arquivo", "")), fallback_text=raw_text),
+            )
             blocks.append(block_str)
             used_tokens += block_tokens
-            selected_chunks.append(item)
+            selected_chunks.append(enriched)
 
         blocks.append("</contexto_normativo>")
         xml_str = "\n".join(blocks)
@@ -1022,19 +1320,32 @@ class LGPDRagEngine:
         )
         retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 1)
 
+        abstained = self.should_abstain(
+            query=question,
+            retrieved_chunks=budgeted_chunks,
+            matched_concepts=self.last_matched_concepts,
+            fast_path_articles=self.last_fast_path_articles,
+        )
+
         user_prompt = (
             f"{context_xml}\n\n"
             f"Pergunta: {question}\n\n"
-            "Responda seguindo estritamente o FORMATO VISUAL OBRIGATÓRIO (Pirâmide Invertida) e o nível de linguagem "
-            "configurado, baseando-se exclusivamente em <contexto_normativo>."
+            "Responda no formato Pirâmide Invertida no nível de linguagem configurado, "
+            "citando as fontes como [1], [2] e dispositivos em **negrito**, usando exclusivamente <contexto_normativo>."
         )
 
         messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt_str}]
         messages.extend(trimmed_history)
         messages.append({"role": "user", "content": user_prompt})
 
-        prompt_tokens_est = estimate_tokens(system_prompt_str) + estimate_tokens(user_prompt) + sum(
-            estimate_tokens(m["content"]) for m in trimmed_history
+        prompt_tokens_est = (
+            0
+            if abstained
+            else (
+                estimate_tokens(system_prompt_str)
+                + estimate_tokens(user_prompt)
+                + sum(estimate_tokens(m["content"]) for m in trimmed_history)
+            )
         )
         hybrid_count = sum(1 for c in budgeted_chunks if not c.get("is_cross_reference"))
         cross_ref_count = sum(1 for c in budgeted_chunks if c.get("is_cross_reference"))
@@ -1045,7 +1356,8 @@ class LGPDRagEngine:
                 "rewritten_query": self.last_expanded_query or rewritten_query,
                 "matched_concepts": list(self.last_matched_concepts),
                 "fast_path_articles": list(self.last_fast_path_articles),
-                "answer": "",
+                "abstained": abstained,
+                "answer": ABSTENTION_RESPONSE_MD if abstained else "",
                 "provider": active_provider.provider_key,
                 "model_requested": active_provider.model_name,
                 "model_used": active_provider.model_name,
@@ -1070,6 +1382,12 @@ class LGPDRagEngine:
         )
 
         def _token_stream() -> Generator[str, None, None]:
+            if abstained:
+                result["ttft_ms"] = 0.5
+                result["ttft_s"] = 0.0
+                yield ABSTENTION_RESPONSE_MD
+                return
+
             t_gen_start = time.perf_counter()
             first_token_received = False
             collected: List[str] = []

@@ -40,16 +40,82 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_TEMPERATURE = 0.1
 
 PROVIDER_LABELS: Dict[str, str] = {
     "gemini": "Google Gemini (Flash / Cloud)",
+    "groq": "Groq Cloud (Free Tier / LPU)",
+    "openrouter": "OpenRouter (Free Tier)",
     "openai": "OpenAI (ChatGPT)",
     "anthropic": "Anthropic (Claude)",
     "ollama": "Qwen Local (Ollama)",
 }
 
-# Políticas padrão por Tier (Fase 3)
+# Contextos de Performance (Convergência entre Modo de Operação e Capacidade do Modelo)
+OPERATING_MODE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "fast_eco": {
+        "mode_id": "fast_eco",
+        "label": "⚡ Rápido & Econômico (Baixa Latência / Free Tier)",
+        "short_label": "⚡ Rápido & Econômico",
+        "target_tier": "economic",
+        "speed_class": "Ultra-Rápida (TTFT < 1s)",
+        "description": (
+            "Converge para modelos leves de alta vazão (Flash-Lite, Instant LPU, Mini, Haiku, 3B). "
+            "Envia Top-3 dispositivos (teto de 1.200 tokens e 1 turno de histórico) para máxima velocidade e economia de cota."
+        ),
+        "preferred_models": {
+            "gemini": "gemini-3.5-flash-lite",
+            "groq": "llama-3.1-8b-instant",
+            "openrouter": "google/gemma-3-27b-it:free",
+            "openai": "gpt-4o-mini",
+            "anthropic": "claude-3-5-haiku-latest",
+            "ollama": "qwen2.5:3b",
+        },
+    },
+    "high_precision": {
+        "mode_id": "high_precision",
+        "label": "🎯 Alta Precisão Jurídica (Raciocínio Profundo)",
+        "short_label": "🎯 Alta Precisão",
+        "target_tier": "recommended",
+        "speed_class": "Alta Densidade Analítica",
+        "description": (
+            "Converge para modelos de maior capacidade cognitiva (Gemini 3.8 Flash, Llama 3.3 70B, Qwen 72B, GPT-4o, Sonnet 4, Qwen 7B/14B). "
+            "Envia Top-5 dispositivos + referência cruzada (teto de 2.200 tokens e 3 turnos de histórico) para pareceres completos."
+        ),
+        "preferred_models": {
+            "gemini": "gemini-3.8-flash",
+            "groq": "llama-3.3-70b-versatile",
+            "openrouter": "qwen/qwen-2.5-72b-instruct:free",
+            "openai": "gpt-4o",
+            "anthropic": "claude-sonnet-4-20250514",
+            "ollama": "qwen2.5:14b",
+        },
+    },
+    "local_offline": {
+        "mode_id": "local_offline",
+        "label": "🖥️ Local & Privado (100% Offline via Ollama)",
+        "short_label": "🖥️ Local / Offline",
+        "target_tier": "recommended",
+        "speed_class": "Processamento Local Dedicado (Zero Nuvem)",
+        "description": (
+            "Executa 100% offline via Ollama. Ajusta automaticamente o KV-Cache (num_ctx 2048–4096) "
+            "e o orçamento de tokens conforme o porte do modelo local (3B vs 7B vs 14B)."
+        ),
+        "preferred_models": {
+            "ollama": "qwen2.5:7b",
+            "gemini": "gemini-3.5-flash-lite",
+            "groq": "llama-3.1-8b-instant",
+            "openrouter": "google/gemma-3-27b-it:free",
+            "openai": "gpt-4o-mini",
+            "anthropic": "claude-3-5-haiku-latest",
+        },
+    },
+}
+
+# Políticas padrão por Tier (Fase 3) — Funil enxuto otimizado para baixa latência e economia de tokens
 TIER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "recommended": {
         "tier": "recommended",
@@ -77,16 +143,28 @@ TIER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Catálogo completo de modelos por provedor com metadados explícitos (Fase 3)
+# Catálogo completo de modelos por provedor com metadados explícitos (Fases 1 e 3)
 MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
     "gemini": {
-        "gemini-3.8-flash": {
-            **TIER_DEFAULTS["recommended"],
-            "label": "Gemini 3.8 Flash (Recomendado / Baixa Latência)",
+        "gemini-3.5-flash-lite": {
+            **TIER_DEFAULTS["economic"],
+            "label": "Gemini 3.5 Flash-Lite (Padrão Free Tier / Ultra-Rápido)",
             "context_window": 1000000,
             "selectable": True,
         },
-        # Mantidos no catálogo apenas para retrocompatibilidade de metadados/testes (ocultos na UI pois retornam 404/503 na API atual)
+        "gemini-3.8-flash": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Gemini 3.8 Flash (Alta Precisão / Recomendado)",
+            "context_window": 1000000,
+            "selectable": True,
+        },
+        "gemma-4-27b-it": {
+            **TIER_DEFAULTS["economic"],
+            "label": "Gemma 4 27B IT (Fallback Gratuito)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+        # Mantidos no catálogo para retrocompatibilidade de metadados/testes (redirecionados automaticamente)
         "gemini-2.5-flash": {
             **TIER_DEFAULTS["recommended"],
             "label": "Gemini 2.5 Flash (Legado -> Redirecionado para 3.8 Flash)",
@@ -96,16 +174,56 @@ MODEL_CATALOG: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "gemini-2.5-flash-lite": {
             **TIER_DEFAULTS["economic"],
-            "label": "Gemini 2.5 Flash-Lite (Legado -> Redirecionado para 3.8 Flash)",
+            "label": "Gemini 2.5 Flash-Lite (Legado -> Redirecionado para 3.5 Flash-Lite)",
             "context_window": 1000000,
             "selectable": False,
-            "legacy_alias_for": "gemini-3.8-flash",
+            "legacy_alias_for": "gemini-3.5-flash-lite",
         },
         "gemini-nano-legacy": {
             **TIER_DEFAULTS["unsupported"],
             "label": "Gemini Nano Legacy (Não Suportado)",
             "context_window": 2048,
             "selectable": False,
+        },
+    },
+    "groq": {
+        "llama-3.3-70b-versatile": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Llama 3.3 70B Versatile (Groq Free Tier)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+        "qwen-2.5-32b": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Qwen 2.5 32B (Groq Free Tier)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+        "llama-3.1-8b-instant": {
+            **TIER_DEFAULTS["economic"],
+            "label": "Llama 3.1 8B Instant (Econômico / LPU)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+    },
+    "openrouter": {
+        "qwen/qwen-2.5-72b-instruct:free": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Qwen 2.5 72B Instruct (OpenRouter Free)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+        "meta-llama/llama-3.3-70b-instruct:free": {
+            **TIER_DEFAULTS["recommended"],
+            "label": "Llama 3.3 70B Instruct (OpenRouter Free)",
+            "context_window": 128000,
+            "selectable": True,
+        },
+        "google/gemma-3-27b-it:free": {
+            **TIER_DEFAULTS["economic"],
+            "label": "Google Gemma 3 27B IT (OpenRouter Free)",
+            "context_window": 128000,
+            "selectable": True,
         },
     },
     "openai": {
@@ -184,12 +302,16 @@ def normalize_provider_key(provider_name: str) -> str:
         return "ollama"
     if any(k in cleaned for k in ("gemini", "google")):
         return "gemini"
+    if "groq" in cleaned:
+        return "groq"
+    if "openrouter" in cleaned:
+        return "openrouter"
     if any(k in cleaned for k in ("openai", "chatgpt", "gpt")):
         return "openai"
     if any(k in cleaned for k in ("anthropic", "claude")):
         return "anthropic"
     raise ValueError(
-        f"Provedor desconhecido: '{provider_name}'. Opções válidas: gemini, openai, anthropic, ollama."
+        f"Provedor desconhecido: '{provider_name}'. Opções válidas: gemini, groq, openrouter, openai, anthropic, ollama."
     )
 
 
@@ -205,12 +327,16 @@ def get_selectable_models(provider_id: str, include_unsupported: bool = False) -
 
 
 GEMINI_MODELS: List[str] = get_selectable_models("gemini")
+GROQ_MODELS: List[str] = get_selectable_models("groq")
+OPENROUTER_MODELS: List[str] = get_selectable_models("openrouter")
 OPENAI_MODELS: List[str] = get_selectable_models("openai")
 ANTHROPIC_MODELS: List[str] = get_selectable_models("anthropic")
 OLLAMA_MODELS: List[str] = get_selectable_models("ollama")
 
 PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
-    "gemini": "gemini-3.8-flash",
+    "gemini": "gemini-3.5-flash-lite",
+    "groq": "llama-3.3-70b-versatile",
+    "openrouter": "qwen/qwen-2.5-72b-instruct:free",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-3-5-haiku-latest",
     "ollama": "qwen2.5:7b",
@@ -236,10 +362,131 @@ def get_model_metadata(provider_id: str, model_id: Optional[str] = None) -> Dict
     lower_m = resolved_model.lower()
     if any(u in lower_m for u in ("0.5b", "1b", "1.1b", "nano", "tiny", "instruct-legacy", "unsupported")):
         return {**TIER_DEFAULTS["unsupported"], "label": resolved_model}
-    if any(e in lower_m for e in ("3b", "mini", "haiku", "lite", "7b-instruct", "2.0-flash")):
+    if any(e in lower_m for e in ("3b", "mini", "haiku", "lite", "7b-instruct", "2.0-flash", "8b-instant", "27b")):
         return {**TIER_DEFAULTS["economic"], "label": resolved_model}
 
     return {**TIER_DEFAULTS["recommended"], "label": resolved_model}
+
+
+def infer_operating_mode_for_model(provider_id: str, model_id: str) -> str:
+    """
+    Infere o Modo de Operação (Contexto de Performance) ideal a partir da capacidade do modelo:
+    - Modelos do provedor `ollama` -> se `3b`/`economic` pode operar em `fast_eco` ou `local_offline`;
+    - Modelos de tier `economic` (Flash-Lite, 8B Instant, Mini, Haiku, Gemma 27B) -> `fast_eco`;
+    - Modelos de tier `recommended` (Gemini 3.8 Flash, 70B, 72B, GPT-4o, Sonnet 4, 14B) -> `high_precision`.
+    """
+    try:
+        key = normalize_provider_key(provider_id)
+    except ValueError:
+        key = "gemini"
+    meta = get_model_metadata(key, model_id)
+    tier = str(meta.get("tier", "recommended"))
+    if tier == "economic":
+        return "fast_eco"
+    return "high_precision"
+
+
+def get_models_for_operating_mode(
+    provider_id: str,
+    operating_mode: str = "fast_eco",
+) -> List[str]:
+    """
+    Retorna a lista de modelos do provedor que convergem com o Contexto de Performance (`operating_mode`):
+    - `fast_eco`: prioriza/filtra modelos `economic` (baixa latência e alto throughput).
+    - `high_precision`: prioriza/filtra modelos `recommended` (raciocínio jurídico profundo).
+    - `local_offline`: retorna modelos locais suportados no Ollama (`qwen2.5:7b`, `qwen2.5:14b`, `qwen2.5:3b`).
+    """
+    key = normalize_provider_key(provider_id)
+    all_selectable = get_selectable_models(key, include_unsupported=False)
+    if not all_selectable:
+        return []
+
+    if operating_mode == "local_offline" or key == "ollama":
+        if operating_mode == "fast_eco":
+            eco = [m for m in all_selectable if get_model_metadata(key, m).get("tier") == "economic"]
+            rec = [m for m in all_selectable if m not in eco]
+            return eco + rec
+        if operating_mode == "high_precision":
+            rec = [m for m in all_selectable if get_model_metadata(key, m).get("tier") == "recommended"]
+            eco = [m for m in all_selectable if m not in rec]
+            return rec + eco
+        return all_selectable
+
+    target_tier = "economic" if operating_mode == "fast_eco" else "recommended"
+    matching = [
+        m for m in all_selectable if get_model_metadata(key, m).get("tier") == target_tier
+    ]
+    others = [m for m in all_selectable if m not in matching]
+    # Coloca os modelos do tier convergente no topo e mantém os demais acessíveis logo abaixo
+    return matching + others
+
+
+def get_preferred_model_for_mode(provider_id: str, operating_mode: str = "fast_eco") -> str:
+    """Retorna o modelo padrão ideal de `provider_id` para o `operating_mode` selecionado."""
+    key = normalize_provider_key(provider_id)
+    profile = OPERATING_MODE_PROFILES.get(operating_mode, OPERATING_MODE_PROFILES["fast_eco"])
+    pref = profile.get("preferred_models", {}).get(key)
+    selectable = get_selectable_models(key, include_unsupported=False)
+    if pref and pref in selectable:
+        return pref
+    converged_list = get_models_for_operating_mode(key, operating_mode)
+    if converged_list:
+        return converged_list[0]
+    return PROVIDER_DEFAULT_MODELS.get(key, "gemini-3.5-flash-lite")
+
+
+def get_model_performance_context(
+    provider_id: str,
+    model_id: Optional[str] = None,
+    operating_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Constrói o diagnóstico completo de convergência entre a capacidade do modelo e o contexto de performance:
+    Retorna tier, modo convergente, classe de velocidade, orçamento de tokens, Top-K, histórico e resumo técnico.
+    """
+    try:
+        key = normalize_provider_key(provider_id)
+    except ValueError:
+        key = "gemini"
+    resolved_model = (model_id or PROVIDER_DEFAULT_MODELS.get(key, "gemini-3.5-flash-lite")).strip()
+    meta = get_model_metadata(key, resolved_model)
+    tier = str(meta.get("tier", "recommended"))
+
+    inferred_mode = "local_offline" if key == "ollama" else (
+        "fast_eco" if tier == "economic" else "high_precision"
+    )
+    active_mode = operating_mode if operating_mode in OPERATING_MODE_PROFILES else inferred_mode
+    mode_profile = OPERATING_MODE_PROFILES.get(active_mode, OPERATING_MODE_PROFILES["fast_eco"])
+
+    if key == "ollama":
+        if tier == "economic":
+            fit_reason = "Modelo local compacto (3B): KV-Cache reduzido (num_ctx=2048) e Top-3 chunks para máxima fluidez em CPU/RAM."
+        elif "14b" in resolved_model.lower():
+            fit_reason = "Modelo local denso (14B): Janela ampla (num_ctx=4096) e Top-5 chunks para análise jurídica profunda offline."
+        else:
+            fit_reason = "Modelo local equilibrado (7B): Excelente balanço entre precisão normativa e velocidade offline (num_ctx=4096)."
+    elif tier == "economic":
+        fit_reason = "Alta velocidade e eficiência de cota (Free Tier): prioriza TTFT < 1s com contexto enxuto (Top-3 trechos / 1.200 tokens)."
+    else:
+        fit_reason = "Alta capacidade analítica e raciocínio multi-artigos: habilita contexto expandido (Top-5 trechos / 2.200 tokens + referência cruzada)."
+
+    return {
+        "provider_key": key,
+        "provider_label": PROVIDER_LABELS.get(key, key),
+        "model_id": resolved_model,
+        "model_label": meta.get("label", resolved_model),
+        "tier": tier,
+        "inferred_mode": inferred_mode,
+        "operating_mode": active_mode,
+        "mode_label": mode_profile["label"],
+        "mode_short_label": mode_profile["short_label"],
+        "speed_class": mode_profile["speed_class"],
+        "top_k": int(meta.get("top_k", 4)),
+        "max_context_tokens": int(meta.get("max_context_tokens", 1800)),
+        "max_history_turns": int(meta.get("max_history_turns", 2)),
+        "context_window": int(meta.get("context_window", 128000)),
+        "fit_reason": fit_reason,
+    }
 
 
 def _read_secret_or_env(*keys: str) -> Optional[str]:
@@ -266,12 +513,15 @@ def sanitize_api_key(raw_key: Optional[str]) -> str:
     Higieniza o campo de API Key:
     - Remove espaços invisíveis Unicode (zero-width, non-breaking space) e aspas ao redor.
     - Caso o usuário tenha colado uma linha inteira (ex.: `GEMINI_API_KEY="AIzaSy..."` ou texto ao redor da chave),
-      extrai automaticamente apenas o token ASCII da chave (`AIza...` ou `sk-...`).
+      extrai automaticamente apenas o token ASCII da chave (`AIza...`, `gsk_...`, `sk-...`).
     """
     if not raw_key:
         return ""
     cleaned = re.sub(r"[\u200b\u200c\u200d\ufeff\xa0]+", " ", str(raw_key)).strip().strip("\"'`")
-    token_match = re.search(r"(AIza[0-9A-Za-z\-_]{20,}|sk-[0-9A-Za-z\-_]{15,})", cleaned)
+    token_match = re.search(
+        r"(AIza[0-9A-Za-z\-_]{20,}|gsk_[0-9A-Za-z\-_]{16,}|sk-[0-9A-Za-z\-_]{15,})",
+        cleaned,
+    )
     if token_match:
         return token_match.group(1)
     return cleaned.strip()
@@ -300,6 +550,10 @@ def get_provider_api_key(provider_id: str, user_api_key: Optional[str] = None) -
     raw_env_key: Optional[str] = None
     if key == "gemini":
         raw_env_key = _read_secret_or_env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    elif key == "groq":
+        raw_env_key = _read_secret_or_env("GROQ_API_KEY")
+    elif key == "openrouter":
+        raw_env_key = _read_secret_or_env("OPENROUTER_API_KEY")
     elif key == "openai":
         raw_env_key = _read_secret_or_env("OPENAI_API_KEY")
     elif key == "anthropic":
@@ -429,6 +683,10 @@ def detect_runtime_environment(base_url: str = DEFAULT_OLLAMA_URL) -> Dict[str, 
     # Seleção inteligente de provedor padrão em nuvem
     if get_provider_api_key("gemini"):
         cloud_default = "gemini"
+    elif get_provider_api_key("groq"):
+        cloud_default = "groq"
+    elif get_provider_api_key("openrouter"):
+        cloud_default = "openrouter"
     elif get_provider_api_key("openai"):
         cloud_default = "openai"
     elif get_provider_api_key("anthropic"):
@@ -458,7 +716,7 @@ def get_available_providers(ollama_online: bool = False) -> List[str]:
     - No modo Cloud (`ollama_online=False`), oculta `ollama` do seletor principal para evitar erro.
     - No modo Local (`ollama_online=True`), inclui todos os provedores (nuvem + local).
     """
-    cloud_providers = ["gemini", "openai", "anthropic"]
+    cloud_providers = ["gemini", "groq", "openrouter", "openai", "anthropic"]
     if ollama_online:
         return cloud_providers + ["ollama"]
     return cloud_providers
@@ -468,12 +726,18 @@ def scrub_sensitive_keys(text: str) -> str:
     """Remove padrões de chaves de API de mensagens de erro/logs para evitar vazamento."""
     if not text:
         return ""
-    scrubbed = re.sub(r"\b(AIza[0-9A-Za-z\-_]{20,}|sk-[0-9A-Za-z\-_]{16,}|hf_[0-9A-Za-z]{16,})\b", "[REDACTED_KEY]", text)
+    scrubbed = re.sub(
+        r"\b(AIza[0-9A-Za-z\-_]{20,}|gsk_[0-9A-Za-z\-_]{16,}|sk-[0-9A-Za-z\-_]{16,}|hf_[0-9A-Za-z]{16,})\b",
+        "[REDACTED_KEY]",
+        text,
+    )
     return scrubbed
 
 
 PROVIDER_USAGE_URLS: Dict[str, str] = {
     "gemini": "https://aistudio.google.com/usage",
+    "groq": "https://console.groq.com/settings/limits",
+    "openrouter": "https://openrouter.ai/settings/keys",
     "openai": "https://platform.openai.com/usage",
     "anthropic": "https://console.anthropic.com/settings/limits",
 }
@@ -808,11 +1072,16 @@ class BaseLLMProvider(ABC):
                 f"{'Usuário' if t['role'] == 'user' else 'Assistente'}: {t['content']}"
                 for t in chat_turns[:-1]
             ]
-            user_payload = (
-                "Histórico recente da conversa:\n"
-                + "\n".join(history_lines)
-                + f"\n\nMensagem atual:\n{chat_turns[-1]['content']}"
-            )
+            current_content = chat_turns[-1]["content"]
+            hist_block = "[Histórico Recente]\n" + "\n".join(history_lines)
+            if "\n\nPergunta:" in current_content:
+                user_payload = current_content.replace(
+                    "\n\nPergunta:",
+                    f"\n\n{hist_block}\n\nPergunta:",
+                    1,
+                )
+            else:
+                user_payload = f"{hist_block}\n\nMensagem atual:\n{current_content}"
 
         if not self.metadata.get("supports_streaming", True):
             full_text = self.generate(
@@ -883,12 +1152,16 @@ class OllamaProvider(BaseLLMProvider):
         max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
         host = (self.base_url or DEFAULT_OLLAMA_URL).rstrip("/")
+        tier = str(self.metadata.get("tier", "recommended"))
+        dynamic_num_ctx = 2048 if tier == "economic" else 4096
+        default_predict = 450 if tier == "economic" else 650
         options: Dict[str, Any] = {
             "temperature": self.temperature,
-            "num_ctx": 4096,
+            "num_ctx": dynamic_num_ctx,
+            "num_predict": int(max_tokens) if max_tokens is not None else default_predict,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
         }
-        if max_tokens is not None:
-            options["num_predict"] = int(max_tokens)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -950,26 +1223,30 @@ class OllamaProvider(BaseLLMProvider):
 
 
 _GEMINI_CLIENT_CACHE: Dict[str, genai.Client] = {}
+_GEMINI_WORKING_MODEL_CACHE: Dict[Tuple[str, str], str] = {}
 
 
 class GeminiProvider(BaseLLMProvider):
     """
     Provedor Google Gemini (BYOK / Secrets) utilizando EXCLUSIVAMENTE o SDK oficial `google-genai`
-    e `client.models.generate_content_stream`, otimizado para baixa latência com `gemini-3.8-flash`
-    (`thinking_level="MINIMAL"`, reutilização de conexão HTTP e redirecionamento automático de modelos 2.x legados).
+    e `client.models.generate_content_stream`, otimizado para Free Tier e baixa latência:
+    - Padrão: `gemini-3.5-flash-lite` (alta velocidade e maior cota gratuita)
+    - Alta Precisão: `gemini-3.8-flash` (`thinking_level="MINIMAL"`, `include_thoughts=False`)
+    - Fallback Gratuito: `gemma-4-27b-it`
+    - Cache automático do modelo funcional por chave (`_GEMINI_WORKING_MODEL_CACHE`) para eliminar round-trips 404.
     """
 
     provider_key = "gemini"
 
     def __init__(
         self,
-        model_name: str = "gemini-3.8-flash",
+        model_name: str = "gemini-3.5-flash-lite",
         api_key: Optional[str] = None,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> None:
         resolved_key = get_provider_api_key("gemini", user_api_key=api_key)
         super().__init__(
-            model_name=model_name or "gemini-3.8-flash",
+            model_name=model_name or "gemini-3.5-flash-lite",
             temperature=temperature,
             api_key=resolved_key,
         )
@@ -987,7 +1264,11 @@ class GeminiProvider(BaseLLMProvider):
             )
         cached = _GEMINI_CLIENT_CACHE.get(key)
         if cached is None:
-            cached = genai.Client(api_key=key)
+            try:
+                http_opts = types.HttpOptions(timeout=30000)
+                cached = genai.Client(api_key=key, http_options=http_opts)
+            except Exception:
+                cached = genai.Client(api_key=key)
             _GEMINI_CLIENT_CACHE[key] = cached
         return cached
 
@@ -995,9 +1276,9 @@ class GeminiProvider(BaseLLMProvider):
     def _build_thinking_configs(candidate_model: str) -> List[Optional[types.ThinkingConfig]]:
         """
         Retorna a sequência de ThinkingConfig para minimizar drasticamente a latência (TTFT):
-        - Para `gemini-3*` / `gemini-4*` (ex.: `gemini-3.8-flash`): usa `thinking_level="MINIMAL"`
+        - Para `gemini-3*` / `gemini-4*` (ex.: `gemini-3.8-flash`, `gemini-3.5-flash-lite`): usa `thinking_level="MINIMAL"`
           (evitando o modo padrão HIGH que leva 8-15s pensando antes do 1º token), com fallback para `"LOW"` e `None`.
-        - Para outros modelos: `None`.
+        - Para outros modelos (ex.: `gemma-4-*`): `None`.
         """
         lower_m = candidate_model.lower()
         configs: List[Optional[types.ThinkingConfig]] = []
@@ -1024,16 +1305,29 @@ class GeminiProvider(BaseLLMProvider):
         import time as _time
 
         client = self._get_client()
+        key_id = (self.api_key or "default")[-8:]
 
-        # Redireciona automaticamente qualquer modelo 2.x legado/descontinuado para gemini-3.8-flash
-        requested = (self.model_name or "gemini-3.8-flash").strip()
-        if requested.lower().startswith("gemini-2."):
-            active_target = "gemini-3.8-flash"
+        # Redireciona automaticamente qualquer modelo 2.x legado/descontinuado
+        requested = (self.model_name or "gemini-3.5-flash-lite").strip()
+        req_lower = requested.lower()
+        if req_lower.startswith("gemini-2."):
+            active_target = (
+                "gemini-3.5-flash-lite"
+                if "lite" in req_lower or "2.0" in req_lower
+                else "gemini-3.8-flash"
+            )
         else:
             active_target = requested
 
+        cached_working = _GEMINI_WORKING_MODEL_CACHE.get((key_id, active_target))
+        seed_candidates = (
+            (cached_working, active_target, "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemma-4-27b-it")
+            if cached_working
+            else (active_target, "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemma-4-27b-it")
+        )
+
         fallback_models: List[str] = []
-        for candidate in (active_target, "gemini-3.8-flash"):
+        for candidate in seed_candidates:
             if candidate and candidate not in fallback_models:
                 fallback_models.append(candidate)
 
@@ -1068,6 +1362,7 @@ class GeminiProvider(BaseLLMProvider):
                                 yielded_any = True
                                 yield text
                         if yielded_any:
+                            _GEMINI_WORKING_MODEL_CACHE[(key_id, active_target)] = candidate_model
                             self.model_name = candidate_model
                             return
                         break
@@ -1095,7 +1390,7 @@ class GeminiProvider(BaseLLMProvider):
                         ):
                             break
 
-                        # Faz fallback para gemini-3.8-flash se um modelo customizado retornar 404/503
+                        # Faz fallback para o próximo modelo ativo se retornar 404/503
                         if any(
                             code in err_lower
                             for code in (
@@ -1112,7 +1407,6 @@ class GeminiProvider(BaseLLMProvider):
                         raise
                 else:
                     continue
-                # Se saiu do loop de 503 por 404/503 definitivo, avança para o próximo candidate_model
                 if last_exc is not None and any(
                     code in str(last_exc).lower()
                     for code in ("404", "not found", "not_found", "no longer available", "503", "unavailable", "overloaded")
@@ -1188,6 +1482,70 @@ class OpenAIProvider(BaseLLMProvider):
         for event in stream:
             if event.choices and event.choices[0].delta and event.choices[0].delta.content:
                 yield event.choices[0].delta.content
+
+
+class GroqProvider(OpenAIProvider):
+    """Provedor Groq Cloud (Free Tier / LPU) usando o adaptador unificado compatível com OpenAI."""
+
+    provider_key = "groq"
+
+    def __init__(
+        self,
+        model_name: str = "llama-3.3-70b-versatile",
+        api_key: Optional[str] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        base_url: Optional[str] = None,
+    ) -> None:
+        resolved_key = get_provider_api_key("groq", user_api_key=api_key)
+        BaseLLMProvider.__init__(
+            self,
+            model_name=model_name or "llama-3.3-70b-versatile",
+            temperature=temperature,
+            api_key=resolved_key,
+            base_url=base_url or DEFAULT_GROQ_BASE_URL,
+        )
+
+    def _get_client(self) -> Any:
+        if OpenAI is None:
+            raise RuntimeError("SDK `openai` não está instalado no ambiente.")
+        key = get_provider_api_key("groq", user_api_key=self.api_key)
+        if not key:
+            raise ValueError(
+                "API Key da Groq não informada. Insira sua chave `gsk_...` na barra lateral (BYOK)."
+            )
+        return OpenAI(api_key=key, base_url=self.base_url or DEFAULT_GROQ_BASE_URL, timeout=30.0)
+
+
+class OpenRouterProvider(OpenAIProvider):
+    """Provedor OpenRouter (Modelos Free Tier) usando o adaptador unificado compatível com OpenAI."""
+
+    provider_key = "openrouter"
+
+    def __init__(
+        self,
+        model_name: str = "qwen/qwen-2.5-72b-instruct:free",
+        api_key: Optional[str] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        base_url: Optional[str] = None,
+    ) -> None:
+        resolved_key = get_provider_api_key("openrouter", user_api_key=api_key)
+        BaseLLMProvider.__init__(
+            self,
+            model_name=model_name or "qwen/qwen-2.5-72b-instruct:free",
+            temperature=temperature,
+            api_key=resolved_key,
+            base_url=base_url or DEFAULT_OPENROUTER_BASE_URL,
+        )
+
+    def _get_client(self) -> Any:
+        if OpenAI is None:
+            raise RuntimeError("SDK `openai` não está instalado no ambiente.")
+        key = get_provider_api_key("openrouter", user_api_key=self.api_key)
+        if not key:
+            raise ValueError(
+                "API Key do OpenRouter não informada. Insira sua chave `sk-or-...` na barra lateral (BYOK)."
+            )
+        return OpenAI(api_key=key, base_url=self.base_url or DEFAULT_OPENROUTER_BASE_URL, timeout=30.0)
 
 
 class AnthropicProvider(BaseLLMProvider):
@@ -1267,6 +1625,18 @@ class LLMProviderFactory:
             )
         if key == "gemini":
             return GeminiProvider(
+                model_name=resolved_model,
+                api_key=api_key,
+                temperature=temperature,
+            )
+        if key == "groq":
+            return GroqProvider(
+                model_name=resolved_model,
+                api_key=api_key,
+                temperature=temperature,
+            )
+        if key == "openrouter":
+            return OpenRouterProvider(
                 model_name=resolved_model,
                 api_key=api_key,
                 temperature=temperature,

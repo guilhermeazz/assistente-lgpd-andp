@@ -152,6 +152,41 @@ def remove_revoked_and_struck_elements(soup: BeautifulSoup) -> BeautifulSoup:
     return soup
 
 
+def _split_long_article_lines(
+    lines: List[str],
+    max_body_chars: int = 1350,
+) -> List[str]:
+    """
+    Subdivide artigos extensos (ex.: Art. 5º, Art. 7º, Art. 18, Art. 52, Art. 55-J) em
+    sub-chunks coesos de até ~1.350 caracteres (~350 tokens), repetindo o `caput` (primeira linha)
+    no topo de cada sub-chunk subsequente para preservar 100% do contexto hierárquico e evitar
+    truncamento pelo modelo de embeddings ou estouro do orçamento de tokens.
+    """
+    full_body = "\n".join(lines).strip()
+    if len(full_body) <= max_body_chars or len(lines) <= 2:
+        return [full_body]
+
+    caput = lines[0].strip()
+    sub_bodies: List[str] = []
+    current_lines: List[str] = [caput]
+    current_len = len(caput)
+
+    for line in lines[1:]:
+        line_len = len(line) + 1
+        if current_len + line_len > max_body_chars and len(current_lines) > 1:
+            sub_bodies.append("\n".join(current_lines).strip())
+            current_lines = [caput, line]
+            current_len = len(caput) + line_len
+        else:
+            current_lines.append(line)
+            current_len += line_len
+
+    if len(current_lines) > 1 or not sub_bodies:
+        sub_bodies.append("\n".join(current_lines).strip())
+
+    return sub_bodies
+
+
 def _clean_line(line: str) -> str:
     """Normaliza espaços múltiplos, non-breaking spaces (&nbsp;) e quebras internas de linha."""
     return re.sub(r"\s+", " ", line.replace("\xa0", " ")).strip()
@@ -296,7 +331,6 @@ def _parse_lgpd_html_content(raw_html: str, source_filename: str) -> List[Dict[s
         secao = art_info["secao"]
         body_text = art_info["body_text"]
         breadcrumb = f"[Lei nº 13.709/2018 (LGPD) | {capitulo} | {secao} | {art_id}]"
-        full_text = f"{breadcrumb}\n{body_text}"
         artigos_citados = extract_artigos_citados(body_text, self_artigo=art_id)
 
         slug_id = (
@@ -306,25 +340,27 @@ def _parse_lgpd_html_content(raw_html: str, source_filename: str) -> List[Dict[s
             .replace("-", "_")
             .strip()
         )
-        chunk_id = f"lgpd_{slug_id}"
-
-        chunks.append(
-            {
-                "id": chunk_id,
-                "texto": full_text,
-                "metadata": {
-                    "fonte": "Lei nº 13.709/2018 (LGPD)",
-                    "tipo": "lgpd_artigo",
-                    "capitulo": capitulo,
-                    "secao": secao,
-                    "artigo": art_id,
-                    "artigos_citados": artigos_citados,
-                    "pagina": idx,
-                    "arquivo": source_filename,
-                    "breadcrumb": breadcrumb,
-                },
-            }
-        )
+        sub_bodies = _split_long_article_lines(art_info["lines"], max_body_chars=1350)
+        for part_idx, sub_body in enumerate(sub_bodies, start=1):
+            chunk_id = f"lgpd_{slug_id}" if part_idx == 1 else f"lgpd_{slug_id}_p{part_idx}"
+            full_text = f"{breadcrumb}\n{sub_body}"
+            chunks.append(
+                {
+                    "id": chunk_id,
+                    "texto": full_text,
+                    "metadata": {
+                        "fonte": "Lei nº 13.709/2018 (LGPD)",
+                        "tipo": "lgpd_artigo",
+                        "capitulo": capitulo,
+                        "secao": secao,
+                        "artigo": art_id,
+                        "artigos_citados": artigos_citados,
+                        "pagina": idx,
+                        "arquivo": source_filename,
+                        "breadcrumb": breadcrumb,
+                    },
+                }
+            )
 
     return chunks
 
@@ -363,8 +399,8 @@ def parse_lgpd_html(html_path: Path) -> List[Dict[str, Any]]:
 
 def _split_markdown_with_overlap(
     text: str,
-    chunk_size: int = 1800,
-    overlap: int = 250,
+    chunk_size: int = 1200,
+    overlap: int = 180,
 ) -> List[str]:
     """
     Segmenta o texto Markdown de uma página de PDF em chunks de ~1800 caracteres
@@ -415,8 +451,8 @@ def _friendly_anpd_doc_name(pdf_path: Path) -> str:
 
 def parse_anpd_pdf(
     pdf_path: Path,
-    chunk_size: int = 1800,
-    overlap: int = 250,
+    chunk_size: int = 1200,
+    overlap: int = 180,
 ) -> List[Dict[str, Any]]:
     """
     Converte um PDF da ANPD em Markdown por página usando pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
